@@ -1,0 +1,275 @@
+"""
+Simplified database save utility with direct to_sql approach.
+"""
+
+import pandas as pd
+import logging
+from typing import Dict
+from django.db import connections
+import sqlalchemy
+from sqlalchemy import event, create_engine
+
+import time
+from datetime import datetime
+import re
+from dotenv import load_dotenv
+import os
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+
+def fix_datetime_value(value):
+    """Fix problematic datetime values that cause SQL Server conversion errors."""
+    if pd.isna(value) or value == '':
+        return None
+    
+    # Convert to string if not already
+    str_value = str(value).strip()
+    
+    # Handle common problematic patterns
+    if re.match(r'^\d{1,2}:\d{2}\.\d+$', str_value):  # e.g., "01:41.0", "25:04.0"
+        return None  # These are invalid datetime formats, set to NULL
+    
+    # Handle ISO datetime format
+    if 'T' in str_value and 'Z' in str_value:
+        try:
+            # Parse ISO format like "2022-06-01T00:01:41Z"
+            dt = datetime.fromisoformat(str_value.replace('Z', '+00:00'))
+            return dt.strftime('%Y-%m-%d %H:%M:%S')
+        except:
+            return None
+    
+    # Handle date-only format
+    if re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', str_value):  # e.g., "6/1/2022"
+        try:
+            dt = datetime.strptime(str_value, '%m/%d/%Y')
+            return dt.strftime('%Y-%m-%d')
+        except:
+            return None
+    
+    # If we can't parse it, return None (NULL in database)
+    return None
+import urllib.parse
+def create_mssql_connection():
+    driver = "ODBC Driver 17 for SQL Server"
+    server = os.getenv('MSSQL_SERVER')
+    database = os.getenv('MSSQL_DATABASE')
+    user = os.getenv('MSSQL_USER')
+    password = os.getenv('MSSQL_PASSWORD')
+    
+    #MSSQL_params = urllib.parse.quote_plus(f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={user};PWD={password}")
+    MSSQL_params = urllib.parse.quote_plus(f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={user};PWD={password};ConnectionTimeout=100;Timeout=100") # old one is 30 than 60 now 100
+
+    MSSQL_sqlalchemy_url = f"mssql+pyodbc:///?odbc_connect={MSSQL_params}"
+    return create_engine(MSSQL_sqlalchemy_url, 
+              echo=False,  
+              pool_recycle=300,  # for future 2 min 
+              pool_size=20,  
+              max_overflow=10,  
+              pool_timeout=60)
+    
+# Create database connection AZURE
+def create_Azure_db_connection():
+    driver = "ODBC Driver 17 for SQL Server"
+    server = os.getenv('AZURE_SERVER')
+    database = os.getenv('AZURE_DATABASE')
+    user = os.getenv('AZURE_USER')
+    password = os.getenv('AZURE_PASSWORD')
+    
+    params = urllib.parse.quote_plus(f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={user};PWD={password}")
+    sqlalchemy_url = f"mssql+pyodbc:///?odbc_connect={params}"
+    return create_engine(sqlalchemy_url, 
+              echo=False)
+
+def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: str) -> Dict:
+    """
+    Simple database save that relies on pandas to_sql auto-column matching.
+    """
+    
+    # Marketplace to table mapping
+    MARKETPLACE_TABLE_MAPPING = {
+        'A1PA6795UKMFR9': 'amazon_api_de_test',  # Germany
+        'A1RKKUPIHCS9HS': 'amazon_api_es_test',  # Spain
+        'APJ6JRA9NG5V4': 'amazon_api_it_test',   # Italy
+        'A1F83G8C2ARO7P': 'amazon_api_uk_test',  # United Kingdom
+    }
+    
+    results = {
+        'success': True,
+        'mssql_result': None,
+        'azure_result': None,
+        'total_records_saved': 0,
+        'errors': []
+    }
+    
+    try:
+        # # Get engines
+        # secondary_conn = connections['secondary']
+        # tertiary_conn = connections['tertiary']
+        
+        # secondary_settings = secondary_conn.settings_dict
+        # tertiary_settings = tertiary_conn.settings_dict
+        
+        # # Create simple connection strings with proper port handling
+        # secondary_port = secondary_settings.get('PORT') or 1433
+        # if isinstance(secondary_port, str) and secondary_port.strip() == '':
+        #     secondary_port = 1433
+        
+        # tertiary_port = tertiary_settings.get('PORT') or 1433
+        # if isinstance(tertiary_port, str) and tertiary_port.strip() == '':
+        #     tertiary_port = 1433
+        
+        # logger.info(f"🔗 Connecting to secondary DB: {secondary_settings['HOST']}:{secondary_port}")
+        # secondary_engine = create_engine(
+        #     f"mssql+pyodbc://{secondary_settings['USER']}:{secondary_settings['PASSWORD']}"
+        #     f"@{secondary_settings['HOST']}:{secondary_port}"
+        #     f"/{secondary_settings['NAME']}?driver=ODBC+Driver+17+for+SQL+Server",
+        #     echo=False
+        # )
+        
+        # logger.info(f"🔗 Connecting to tertiary DB: {tertiary_settings['HOST']}:{tertiary_port}")
+        # tertiary_engine = create_engine(
+        #     f"mssql+pyodbc://{tertiary_settings['USER']}:{tertiary_settings['PASSWORD']}"
+        #     f"@{tertiary_settings['HOST']}:{tertiary_port}"
+        #     f"/{tertiary_settings['NAME']}?driver=ODBC+Driver+17+for+SQL+Server",
+        #     echo=False
+        # )
+        MSSQL_engine = create_mssql_connection()
+        logging.info(f"MSSQL_engine : {MSSQL_engine}")
+    
+        def my_listener(conn, cursor, statement, parameters, context, executemany):
+            if executemany:
+                cursor.fast_executemany = True
+
+        event.listen(MSSQL_engine, "before_cursor_execute", my_listener)
+        # Save MSSQL DataFrame
+        table_name = MARKETPLACE_TABLE_MAPPING.get(marketplace_id)
+        if table_name and not mssql_df.empty:
+            logger.info(f"🔄 Saving MSSQL data: {len(mssql_df)} records to {table_name}")
+            logger.info(f"MSSQL columns: {list(mssql_df.columns)}")
+            
+            # Clean data
+            df_clean = mssql_df.copy()
+            # df_clean = mssql_df.copy().fillna('')
+            print("MSSQLdf_clean columns: ", df_clean.columns)
+            
+            # Convert float columns that should be integers based on your schema
+            integer_columns = [
+                'NumberOfItemsShipped', 'QuantityShipped', 'QuantityOrdered'
+            ]
+            
+            for col in integer_columns:
+                if col in df_clean.columns:
+                    # Convert float to int, handling NaN values
+                    df_clean[col] = df_clean[col].fillna(0).astype(float).astype(int)
+                    logger.info(f"🔧 Converted {col} from float to int")
+            
+            # Convert float columns that should remain as float but ensure proper format
+            float_columns = [
+                'PromotionDiscountTax.Amount', 'ShippingTax.Amount', 'ShippingPrice.Amount',
+                'ShippingDiscount.Amount', 'ShippingDiscountTax.Amount', 'vat',
+                'item_subtotal', 'promotion', 'Promotional_Tax', 'unit_price(vat_inclusive)',
+                'vat%', 'calculated_vat', 'unit_price(vat_exclusive)', 'item_total', 'grand_total'
+            ]
+            
+            for col in float_columns:
+                if col in df_clean.columns:
+                    # Ensure proper float format
+                    df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0.0)
+                    logger.info(f"🔧 Ensured {col} is proper float format")
+            
+            # Handle datetime columns - convert datetime objects to strings for nvarchar columns
+            datetime_string_columns = ['PurchaseDate', 'EarliestShipDate', 'LatestShipDate']
+            for col in datetime_string_columns:
+                if col in df_clean.columns:
+                    # Convert datetime to string format
+                    df_clean[col] = df_clean[col].astype(str)
+                    logger.info(f"🔧 Converted {col} to string format")
+            
+            # Handle PurchaseDate_Materialized as proper date
+            if 'PurchaseDate_Materialized' in df_clean.columns:
+                df_clean['PurchaseDate_Materialized'] = pd.to_datetime(df_clean['PurchaseDate_Materialized'], errors='coerce')
+                logger.info("🔧 Converted PurchaseDate_Materialized to proper datetime")
+            
+            # Let pandas handle the column matching automatically
+            df_clean.to_sql(
+                name=table_name,
+                con=MSSQL_engine,
+                if_exists='append',
+                index=False,
+                # method='multi',
+                # chunksize=100
+            )
+            
+            results['mssql_result'] = {
+                'success': True,
+                'records_saved': len(df_clean),
+                'table_name': table_name
+            }
+            results['total_records_saved'] += len(df_clean)
+            logger.info(f"✅ MSSQL save successful: {len(df_clean)} records")
+        
+        # Save Azure DataFrame
+        if not azure_df.empty:
+            logger.info(f"🔄 Saving Azure data: {len(azure_df)} records to stg_tr_amazon_raw_test")
+            logger.info(f"Azure columns: {list(azure_df.columns)}")
+            
+            # Clean data and fix datetime columns
+            df_clean = azure_df.copy()
+            print("Azure df_clean columns: ", df_clean.columns)
+            
+            # Handle datetime columns that might have invalid formats
+            datetime_columns = ['CLEAN_DateTime', 'Date', 'data_fetch_Date']
+            
+            for col in datetime_columns:
+                if col in df_clean.columns:
+                    logger.info(f"🔧 Fixing datetime column: {col}")
+                    df_clean[col] = df_clean[col].apply(fix_datetime_value)
+            
+            # Fill remaining NaN values
+            # df_clean = df_clean.fillna('')
+            
+            engine_AZURE = create_Azure_db_connection()
+            logging.info(f"engine_AZURE : {engine_AZURE}")
+            logging.info(f"{marketplace_id} DATA: {df_clean.shape}")  # -->TABLE
+            
+            def my_listener_2(conn, cursor, statement, parameters, context, executemany):
+                if executemany:
+                    cursor.fast_executemany = True
+
+            event.listen(engine_AZURE, "before_cursor_execute", my_listener_2)
+
+            #merged_df2.to_sql(f"amazon_api_{marketplace_name.lower()}", MSSQL_engine, index=False, if_exists="append")  # append # replace
+            # df_clean.to_sql("stg_tr_amazon_raw", engine_AZURE, index=False, if_exists="append")#append # replace
+            
+            # Let pandas handle the column matching automatically
+            df_clean.to_sql(
+                name='stg_tr_amazon_raw_test',
+                con=engine_AZURE,
+                if_exists='append',
+                index=False,
+                # method = multi and chunksize=10 gives error (keep this commented)
+                # method='multi', 
+                # chunksize=100
+            )
+            
+            results['azure_result'] = {
+                'success': True,
+                'records_saved': len(df_clean),
+                'table_name': 'stg_tr_amazon_raw_test'
+            }
+            results['total_records_saved'] += len(df_clean)
+            logger.info(f"✅ Azure save successful: {len(df_clean)} records")
+        
+        logger.info(f"✅ Simple save completed: {results['total_records_saved']} total records")
+        return results
+        
+    except Exception as e:
+        logger.error(f"❌ Simple save failed: {e}", exc_info=True)
+        return {
+            'success': False,
+            'error': str(e),
+            'total_records_saved': 0,
+            'errors': [str(e)]
+        } 
