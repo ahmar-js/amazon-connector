@@ -1,7 +1,6 @@
 from django.db import models
 from django.core.validators import MinValueValidator
 from django.utils import timezone
-from django_celery_beat.models import PeriodicTask
 import uuid
 
 # Create your models here.
@@ -120,6 +119,17 @@ class Activities(models.Model):
         help_text="Whether the processed data was saved to databases (MSSQL and Azure)"
     )
     
+    # Separate database save tracking
+    mssql_saved = models.BooleanField(
+        default=False,
+        help_text="Whether the processed data was saved to MSSQL database"
+    )
+    
+    azure_saved = models.BooleanField(
+        default=False,
+        help_text="Whether the processed data was saved to Azure database"
+    )
+    
     # Audit fields
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -180,201 +190,12 @@ class Activities(models.Model):
         return self.orders_fetched + self.items_fetched
 
 
-class CronJobStatus(models.Model):
-    """Model to track the status of cron jobs and enforce mutual exclusion"""
-    
-    JOB_TYPES = [
-        ('fetching', 'Fetching Job'),
-        ('syncing', 'Syncing Job'),
-    ]
-    
-    STATUS_CHOICES = [
-        ('idle', 'Idle'),
-        ('running', 'Running'),
-        ('completed', 'Completed'),
-        ('failed', 'Failed'),
-    ]
-    
-    job_type = models.CharField(max_length=20, choices=JOB_TYPES, unique=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='idle')
-    last_run = models.DateTimeField(null=True, blank=True)
-    next_run = models.DateTimeField(null=True, blank=True)
-    last_duration = models.DurationField(null=True, blank=True)
-    task_id = models.CharField(max_length=255, null=True, blank=True)
-    error_message = models.TextField(null=True, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+class MarketplaceLastRun(models.Model):
+    """Model to track the last run time for each marketplace"""
+    marketplace_id = models.CharField(max_length=255)
+    last_run = models.DateTimeField(auto_now_add=True)
     
     class Meta:
-        db_table = 'cron_job_status'
-        verbose_name = 'Cron Job Status'
-        verbose_name_plural = 'Cron Job Statuses'
-    
-    def __str__(self):
-        return f"{self.get_job_type_display()} - {self.get_status_display()}"
-    
-    @classmethod
-    def is_any_job_running(cls):
-        """Check if any job is currently running"""
-        return cls.objects.filter(status='running').exists()
-    
-    @classmethod
-    def is_job_running(cls, job_type):
-        """Check if a specific job type is running"""
-        try:
-            job_status = cls.objects.get(job_type=job_type)
-            return job_status.status == 'running'
-        except cls.DoesNotExist:
-            return False
-    
-    def mark_as_running(self, task_id):
-        """Mark job as running"""
-        self.status = 'running'
-        self.task_id = task_id
-        self.error_message = None
-        self.save()
-    
-    def mark_as_completed(self, duration=None):
-        """Mark job as completed"""
-        self.status = 'completed'
-        self.last_run = timezone.now()
-        if duration:
-            self.last_duration = duration
-        self.task_id = None
-        self.error_message = None
-        self.save()
-    
-    def mark_as_failed(self, error_message):
-        """Mark job as failed"""
-        self.status = 'failed'
-        self.last_run = timezone.now()
-        self.error_message = error_message
-        self.task_id = None
-        self.save()
-
-
-class CronJobConfiguration(models.Model):
-    """Model to store user-configurable cron job settings"""
-    
-    JOB_TYPES = [
-        ('fetching', 'Fetching Job'),
-        ('syncing', 'Syncing Job'),
-    ]
-    
-    job_type = models.CharField(max_length=20, choices=JOB_TYPES, unique=True)
-    enabled = models.BooleanField(default=True)
-    cron_expression = models.CharField(max_length=100, help_text="Cron expression (e.g., '0 0 */15 * *')")
-    description = models.TextField(blank=True)
-    
-    # Fetching job specific fields
-    date_range_days = models.IntegerField(default=15, help_text="Number of days to fetch (for fetching job)")
-    
-    # Syncing job specific fields
-    sync_days_back = models.IntegerField(default=100, help_text="Number of days back to sync (for syncing job)")
-    
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-    
-    class Meta:
-        db_table = 'cron_job_configuration'
-        verbose_name = 'Cron Job Configuration'
-        verbose_name_plural = 'Cron Job Configurations'
-    
-    def __str__(self):
-        return f"{self.get_job_type_display()} - {'Enabled' if self.enabled else 'Disabled'}"
-    
-    @property
-    def periodic_task(self):
-        """Get the associated PeriodicTask"""
-        try:
-            return PeriodicTask.objects.get(name=f"{self.job_type}_job")
-        except PeriodicTask.DoesNotExist:
-            return None
-    
-    def save(self, *args, **kwargs):
-        super().save(*args, **kwargs)
-        self.update_periodic_task()
-    
-    def update_periodic_task(self):
-        """Update or create the associated PeriodicTask"""
-        from django_celery_beat.models import CrontabSchedule
-        
-        # Parse cron expression
-        try:
-            cron_parts = self.cron_expression.strip().split()
-            if len(cron_parts) != 5:
-                raise ValueError("Invalid cron expression")
-            
-            minute, hour, day_of_month, month, day_of_week = cron_parts
-            
-            # Convert cron format to django-celery-beat format
-            if day_of_week == '*':
-                day_of_week = None
-            if day_of_month == '*':
-                day_of_month = None
-            if month == '*':
-                month = None
-            if hour == '*':
-                hour = None
-            if minute == '*':
-                minute = None
-            
-            # Create or get crontab schedule
-            schedule, created = CrontabSchedule.objects.get_or_create(
-                minute=minute or '*',
-                hour=hour or '*',
-                day_of_week=day_of_week or '*',
-                day_of_month=day_of_month or '*',
-                month_of_year=month or '*',
-            )
-            
-            # Task name and function mapping
-            task_mapping = {
-                'fetching': 'api.tasks.fetch_amazon_data_task',
-                'syncing': 'api.tasks.sync_amazon_data_task',
-            }
-            
-            # Update or create periodic task
-            periodic_task, created = PeriodicTask.objects.update_or_create(
-                name=f"{self.job_type}_job",
-                defaults={
-                    'crontab': schedule,
-                    'task': task_mapping[self.job_type],
-                    'enabled': self.enabled,
-                    'args': '[]',
-                    'kwargs': '{}',
-                }
-            )
-            
-        except Exception as e:
-            # Log error but don't fail the save
-            print(f"Error updating periodic task for {self.job_type}: {e}")
-
-
-class CronJobLog(models.Model):
-    """Model to log cron job executions"""
-    
-    STATUS_CHOICES = [
-        ('started', 'Started'),
-        ('completed', 'Completed'),
-        ('failed', 'Failed'),
-    ]
-    
-    job_type = models.CharField(max_length=20)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES)
-    task_id = models.CharField(max_length=255)
-    started_at = models.DateTimeField(auto_now_add=True)
-    completed_at = models.DateTimeField(null=True, blank=True)
-    duration = models.DurationField(null=True, blank=True)
-    records_processed = models.IntegerField(null=True, blank=True)
-    error_message = models.TextField(null=True, blank=True)
-    details = models.JSONField(default=dict, blank=True)
-    
-    class Meta:
-        db_table = 'cron_job_log'
-        verbose_name = 'Cron Job Log'
-        verbose_name_plural = 'Cron Job Logs'
-        ordering = ['-started_at']
-    
-    def __str__(self):
-        return f"{self.job_type} - {self.status} - {self.started_at}"
+        db_table = 'marketplace_last_run'
+        verbose_name = 'Marketplace Last Run'
+        verbose_name_plural = 'Marketplace Last Runs'

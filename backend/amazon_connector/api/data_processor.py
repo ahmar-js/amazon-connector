@@ -46,39 +46,165 @@ class AmazonDataProcessor:
         # Optimize pandas for performance
         pd.set_option('mode.copy_on_write', True)
         logger.info("Amazon Data Processor initialized")
+
+    def last_sunday_of_march(self, year):
+        # Get the last day of March for the given year
+        march_last = datetime(year, 3, 31)
+        # Calculate the offset to the last Sunday
+        offset = (march_last.weekday() + 1) % 7
+        # Subtract the offset to get the last Sunday
+        march_last_sunday = march_last - timedelta(days=offset)
+        # Set the time to 01:00:00
+        march_last_sunday = march_last_sunday.replace(hour=1, minute=0, second=0)
+        return march_last_sunday
+
+    def last_sunday_of_october(self, year):
+        # Get the last day of October for the given year
+        october_31st = datetime(year, 10, 31)
+        # Calculate the offset to the last Sunday
+        offset = (october_31st.weekday() + 1) % 7
+        # Subtract the offset to get the last Sunday
+        last_sunday = october_31st - timedelta(days=offset)
+        # Set the time to 01:00:00
+        last_sunday = last_sunday.replace(hour=1, minute=0, second=0)
+        return last_sunday
+
+    # Function to determine if a given date falls within DST period
+    def is_dst(self, date):
+        year = date.year
+        dst_start = self.last_sunday_of_march(year)
+        dst_end = self.last_sunday_of_october(year)
+        return dst_start <= date < dst_end
+
+    def convert_utc_to_mest(self, utc_timestamp):
+        """Convert UTC timestamp to MEST/CET with error handling and flexible input formats."""
+        try:
+            # Handle different input formats
+            if pd.isna(utc_timestamp) or utc_timestamp == '' or utc_timestamp is None:
+                return None
+            
+            # Convert to string and clean
+            timestamp_str = str(utc_timestamp).strip()
+            
+            # Try different formats Amazon API might return
+            formats_to_try = [
+                '%Y-%m-%dT%H:%M:%SZ',        # Standard format
+                '%Y-%m-%dT%H:%M:%S.%fZ',     # With milliseconds
+                '%Y-%m-%d %H:%M:%S',         # Space separated
+                '%Y-%m-%dT%H:%M:%S',         # Without Z
+            ]
+            
+            dt_utc = None
+            for fmt in formats_to_try:
+                try:
+                    dt_utc = datetime.strptime(timestamp_str, fmt)
+                    break
+                except ValueError:
+                    continue
+            
+            if dt_utc is None:
+                # If all formats fail, try pandas to_datetime as fallback
+                dt_utc = pd.to_datetime(timestamp_str, errors='coerce')
+                if pd.isna(dt_utc):
+                    logger.warning(f"Could not parse timestamp: {utc_timestamp}")
+                    return None
+                dt_utc = dt_utc.to_pydatetime()
+            
+            # Determine the offset based on DST
+            if self.is_dst(dt_utc):
+                dt_mest = dt_utc + timedelta(hours=2)  # MEST (UTC+2)
+            else:
+                dt_mest = dt_utc + timedelta(hours=1)  # CET (UTC+1)
+            
+            return dt_mest
+            
+        except Exception as e:
+            logger.error(f"Error converting timestamp {utc_timestamp}: {str(e)}")
+            return None
+
+    def convert_utc_to_bst(self, utc_timestamp):
+        """Convert UTC timestamp to BST/GMT with error handling and flexible input formats."""
+        try:
+            # Handle different input formats
+            if pd.isna(utc_timestamp) or utc_timestamp == '' or utc_timestamp is None:
+                return None
+            
+            # Convert to string and clean
+            timestamp_str = str(utc_timestamp).strip()
+            
+            # Try different formats Amazon API might return
+            formats_to_try = [
+                '%Y-%m-%dT%H:%M:%SZ',        # Standard format
+                '%Y-%m-%dT%H:%M:%S.%fZ',     # With milliseconds
+                '%Y-%m-%d %H:%M:%S',         # Space separated
+                '%Y-%m-%dT%H:%M:%S',         # Without Z
+            ]
+            
+            dt_utc = None
+            for fmt in formats_to_try:
+                try:
+                    dt_utc = datetime.strptime(timestamp_str, fmt)
+                    break
+                except ValueError:
+                    continue
+            
+            if dt_utc is None:
+                # If all formats fail, try pandas to_datetime as fallback
+                dt_utc = pd.to_datetime(timestamp_str, errors='coerce')
+                if pd.isna(dt_utc):
+                    logger.warning(f"Could not parse timestamp: {utc_timestamp}")
+                    return None
+                dt_utc = dt_utc.to_pydatetime()
+            
+            # Determine the offset based on DST
+            if self.is_dst(dt_utc):
+                dt_bst = dt_utc + timedelta(hours=1)  # BST (UTC+1)
+            else:
+                dt_bst = dt_utc  # GMT (UTC+0)
+            
+            return dt_bst
+            
+        except Exception as e:
+            logger.error(f"Error converting timestamp {utc_timestamp}: {str(e)}")
+            return None
     
-    def _convert_timezone_vectorized(self, utc_series: pd.Series, marketplace: str) -> pd.Series:
+    def _convert_timezone_optimized(self, utc_series: pd.Series, marketplace_name: str) -> pd.Series:
         """
-        Vectorized timezone conversion for better performance.
+        Optimized timezone conversion that uses vectorized operations when possible,
+        falls back to apply for complex cases.
         
         Args:
             utc_series: Series of UTC timestamps
-            marketplace: Marketplace identifier
+            marketplace_name: Marketplace name (e.g., 'UK', 'ES', 'DE', 'IT')
             
         Returns:
             Series of converted timestamps
         """
-        # Convert to datetime if not already
-        dt_series = pd.to_datetime(utc_series, errors='coerce')
+        # try:
+        #     # Try vectorized approach first (fastest)
+        #     marketplace_channel = f"Amazon.{marketplace_name.lower()}" if marketplace_name != 'UK' else 'Amazon.co.uk'
+        #     vectorized_result = self._convert_timezone_vectorized(utc_series, marketplace_channel)
+            
+        #     # Check if vectorized conversion worked (no NaT values where input wasn't NaT)
+        #     input_na_mask = pd.isna(utc_series)
+        #     output_na_mask = pd.isna(vectorized_result)
+        #     unexpected_na = output_na_mask & ~input_na_mask
+            
+        #     if not unexpected_na.any():
+        #         logger.info("Using vectorized timezone conversion (optimal performance)")
+        #         return vectorized_result
+        #     else:
+        #         logger.warning(f"Vectorized conversion failed for {unexpected_na.sum()} records, falling back to apply method")
+                
+        # except Exception as e:
+        #     logger.warning(f"Vectorized timezone conversion failed: {str(e)}, falling back to apply method")
         
-        # Check if the series is already timezone-aware
-        if dt_series.dt.tz is not None:
-            # If already timezone-aware, convert to UTC first, then to target timezone
-            dt_series = dt_series.dt.tz_convert('UTC')
+        # Fallback to apply method with improved functions
+        logger.info("Using apply method for timezone conversion (slower but more robust)")
+        if marketplace_name == "UK":
+            return utc_series.apply(self.convert_utc_to_bst)
         else:
-            # If timezone-naive, assume it's UTC and localize it
-            dt_series = dt_series.dt.tz_localize('UTC')
-        
-        # Determine timezone offset based on marketplace
-        if marketplace == 'Amazon.co.uk':
-            # UK: GMT (UTC+0) or BST (UTC+1)
-            converted = dt_series.dt.tz_convert('Europe/London')
-        else:
-            # EU: CET (UTC+1) or CEST (UTC+2)
-            converted = dt_series.dt.tz_convert('Europe/Berlin')
-        
-        # Remove timezone info to return naive datetime
-        return converted.dt.tz_localize(None)
+            return utc_series.apply(self.convert_utc_to_mest)
     
     def _prepare_dataframes(self, orders_data: List[Dict], order_items_data: List[Dict]) -> pd.DataFrame:
         """
@@ -96,6 +222,7 @@ class AmazonDataProcessor:
         # Convert to DataFrames with optimized dtypes
         orders_df = pd.json_normalize(orders_data)
         items_df = pd.DataFrame(order_items_data)
+        orders_df.to_csv("orders_df.csv")
         print("orders_df.columns", orders_df.columns)
         print("items_df.columns: ", items_df.columns)
         
@@ -107,9 +234,12 @@ class AmazonDataProcessor:
         
         # Rename for consistency
         items_df = items_df.rename(columns={'order_id': 'AmazonOrderId'})
+        items_df.to_csv("items_df.csv")
+
         
         # Merge with outer join to preserve all data
         merged_df = pd.merge(orders_df, items_df, on="AmazonOrderId", how="outer")
+        merged_df.to_csv("merged_df.csv")
         
         logger.info(f"Merged DataFrame shape: {merged_df.shape}")
         return merged_df
@@ -165,7 +295,7 @@ class AmazonDataProcessor:
                             
                             if match:
                                 amount = match.group(1)
-                                currency = match.group(2) if match.group(2) else 'USD'  # Default currency
+                                currency = match.group(2)  # Default currency
                                 try:
                                     amount_values.append(float(amount) if amount else 0.0)
                                 except ValueError:
@@ -181,7 +311,7 @@ class AmazonDataProcessor:
                                         amount_values.append(0.0)
                                     # Try to extract currency code (3 uppercase letters)
                                     currency_match = re.search(r'[A-Z]{3}', value_str)
-                                    currency_values.append(currency_match.group() if currency_match else 'USD')
+                                    currency_values.append(currency_match.group() if currency_match else '')
                                 else:
                                     amount_values.append(0.0)
                                     currency_values.append('USD')
@@ -719,9 +849,8 @@ class AmazonDataProcessor:
             
             # 4. Convert timezone
             if 'PurchaseDate' in merged_df.columns:
-                marketplace_channel = f"Amazon.{marketplace_name.lower()}" if marketplace_name != 'UK' else 'Amazon.co.uk'
-                merged_df['PurchaseDate_conversion'] = self._convert_timezone_vectorized(
-                    merged_df['PurchaseDate'], marketplace_channel
+                merged_df['PurchaseDate_conversion'] = self._convert_timezone_optimized(
+                    merged_df['PurchaseDate'], marketplace_name
                 )
             
             # 5. Convert numeric columns

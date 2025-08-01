@@ -281,6 +281,8 @@ export interface Activity {
   detail: string
   error_message?: string
   database_saved: boolean
+  mssql_saved: boolean
+  azure_saved: boolean
   created_at: string
   updated_at: string
 }

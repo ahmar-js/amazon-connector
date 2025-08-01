@@ -27,6 +27,7 @@ dist-ssr
 
 
 
+
 # Django
 
 ### OSX ###
@@ -125,3 +126,4 @@ creds.json
 *.cursor
 last_run.json
 *.csv
+inventory.py

@@ -147,23 +147,41 @@ export function ActivityDetailsModal({ isOpen, onClose, activity, loading }: Act
                       <Database className="h-4 w-4 text-muted-foreground" />
                       <Label className="text-sm font-medium text-muted-foreground">Database Status</Label>
                     </div>
-                    <div>
+                    <div className="space-y-2">
                       {activity.status === 'completed' ? (
-                        activity.database_saved ? (
+                        <div className="space-y-2">
+                          {/* MSSQL Status */}
                           <div className="flex items-center gap-2">
-                            <Badge className="bg-green-800 hover:bg-green-900 text-white text-xs px-2 py-1">
-                              <CheckCircle className="mr-1 h-3 w-3" />
-                              Successfully Saved
-                            </Badge>
+                            <span className="text-sm text-muted-foreground min-w-[60px]">MSSQL:</span>
+                            {activity.mssql_saved ? (
+                              <Badge className="bg-green-800 hover:bg-green-900 text-white text-xs px-2 py-1">
+                                <CheckCircle className="mr-1 h-3 w-3" />
+                                Saved
+                              </Badge>
+                            ) : (
+                              <Badge variant="destructive" className="text-xs px-2 py-1">
+                                <XCircle className="mr-1 h-3 w-3" />
+                                Failed
+                              </Badge>
+                            )}
                           </div>
-                        ) : (
+                          
+                          {/* Azure Status */}
                           <div className="flex items-center gap-2">
-                            <Badge variant="destructive" className="text-xs px-2 py-1">
-                              <XCircle className="mr-1 h-3 w-3" />
-                              Save Failed
-                            </Badge>
+                            <span className="text-sm text-muted-foreground min-w-[60px]">Azure:</span>
+                            {activity.azure_saved ? (
+                              <Badge className="bg-green-800 hover:bg-green-900 text-white text-xs px-2 py-1">
+                                <CheckCircle className="mr-1 h-3 w-3" />
+                                Saved
+                              </Badge>
+                            ) : (
+                              <Badge variant="destructive" className="text-xs px-2 py-1">
+                                <XCircle className="mr-1 h-3 w-3" />
+                                Failed
+                              </Badge>
+                            )}
                           </div>
-                        )
+                        </div>
                       ) : (
                         <Badge variant="secondary" className="text-xs px-2 py-1">
                           Not Applicable
@@ -270,19 +288,63 @@ export function ActivityDetailsModal({ isOpen, onClose, activity, loading }: Act
                 </div>
               </div>
               
-              {activity.database_saved && activity.detail?.includes('Auto-saved') && (
+              {(activity.mssql_saved || activity.azure_saved) && activity.detail?.includes('Auto-saved') && (
                 <div>
                   <strong>Database Save Details:</strong>
-                  <div className="mt-2 p-3 bg-blue-100 dark:bg-blue-900 rounded">
-                    <div className="flex items-center gap-2 mb-2">
-                      <Database className="h-4 w-4 text-blue-600" />
-                      <span className="text-sm font-medium">Data Successfully Saved to Databases</span>
-                    </div>
-                    <div className="text-xs space-y-1">
-                      <p>• MSSQL Database: Marketplace-specific table updated</p>
-                      <p>• Azure Database: Central data warehouse updated</p>
-                      <p>• All processed records have been permanently stored</p>
-                    </div>
+                  <div className="mt-2 space-y-3">
+                    {/* MSSQL Database Status */}
+                    {activity.mssql_saved ? (
+                      <div className="p-3 bg-green-100 dark:bg-green-900 rounded border border-green-200 dark:border-green-800">
+                        <div className="flex items-center gap-2 mb-2">
+                          <Database className="h-4 w-4 text-green-600" />
+                          <span className="text-sm font-medium text-green-800 dark:text-green-200">MSSQL Database - Success</span>
+                        </div>
+                        <div className="text-xs space-y-1 text-green-700 dark:text-green-300">
+                          <p>• Marketplace-specific table updated successfully</p>
+                          <p>• All processed records have been permanently stored</p>
+                          <p>• Data is available for reporting and analysis</p>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="p-3 bg-red-100 dark:bg-red-900 rounded border border-red-200 dark:border-red-800">
+                        <div className="flex items-center gap-2 mb-2">
+                          <Database className="h-4 w-4 text-red-600" />
+                          <span className="text-sm font-medium text-red-800 dark:text-red-200">MSSQL Database - Failed</span>
+                        </div>
+                        <div className="text-xs space-y-1 text-red-700 dark:text-red-300">
+                          <p>• Unable to save to marketplace-specific table</p>
+                          <p>• Data processing completed but storage failed</p>
+                          <p>• Please contact support for assistance</p>
+                        </div>
+                      </div>
+                    )}
+                    
+                    {/* Azure Database Status */}
+                    {activity.azure_saved ? (
+                      <div className="p-3 bg-green-100 dark:bg-green-900 rounded border border-green-200 dark:border-green-800">
+                        <div className="flex items-center gap-2 mb-2">
+                          <Database className="h-4 w-4 text-green-600" />
+                          <span className="text-sm font-medium text-green-800 dark:text-green-200">Azure Database - Success</span>
+                        </div>
+                        <div className="text-xs space-y-1 text-green-700 dark:text-green-300">
+                          <p>• Central data warehouse updated successfully</p>
+                          <p>• All processed records have been permanently stored</p>
+                          <p>• Data is available for cross-marketplace analysis</p>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="p-3 bg-red-100 dark:bg-red-900 rounded border border-red-200 dark:border-red-800">
+                        <div className="flex items-center gap-2 mb-2">
+                          <Database className="h-4 w-4 text-red-600" />
+                          <span className="text-sm font-medium text-red-800 dark:text-red-200">Azure Database - Failed</span>
+                        </div>
+                        <div className="text-xs space-y-1 text-red-700 dark:text-red-300">
+                          <p>• Unable to save to central data warehouse</p>
+                          <p>• Data processing completed but storage failed</p>
+                          <p>• Please contact support for assistance</p>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

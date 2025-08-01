@@ -471,8 +471,8 @@ export function ActivitiesTable({ className, refreshTrigger }: ActivitiesTablePr
         minSize: 80,
         maxSize: 120,
         cell: ({ row }) => {
-          const saved = row.getValue("database_saved") as boolean
-          const status = row.original.status
+          const activity = row.original
+          const status = activity.status
           
           // Only show database save status for completed activities
           if (status !== 'completed') {
@@ -483,19 +483,41 @@ export function ActivitiesTable({ className, refreshTrigger }: ActivitiesTablePr
             )
           }
           
+          // Determine save status based on individual database results
+          const mssqlSaved = activity.mssql_saved
+          const azureSaved = activity.azure_saved
+          
+          let badgeClass: string
+          let badgeVariant: "default" | "destructive" | "secondary"
+          let icon: JSX.Element
+          let text: string
+          
+          if (mssqlSaved && azureSaved) {
+            // Both databases saved successfully
+            badgeVariant = "default"
+            badgeClass = "bg-green-500 hover:bg-green-600 text-xs"
+            icon = <CheckCircle className="mr-1 h-3 w-3" />
+            text = "Yes"
+          } else if (!mssqlSaved && !azureSaved) {
+            // Neither database saved
+            badgeVariant = "destructive"
+            badgeClass = "text-xs"
+            icon = <XCircle className="mr-1 h-3 w-3" />
+            text = "No"
+          } else {
+            // Partial save (one succeeded, one failed)
+            badgeVariant = "secondary"
+            badgeClass = "bg-yellow-500 hover:bg-yellow-600 text-white text-xs"
+            icon = <AlertCircle className="mr-1 h-3 w-3" />
+            text = "Partial"
+          }
+          
           return (
             <div className="flex items-center justify-center w-full">
-              {saved ? (
-                <Badge variant="default" className="bg-green-500 hover:bg-green-600 text-xs">
-                  <CheckCircle className="mr-1 h-3 w-3" />
-                  Yes
-                </Badge>
-              ) : (
-                <Badge variant="destructive" className="text-xs">
-                  <XCircle className="mr-1 h-3 w-3" />
-                  No
-                </Badge>
-              )}
+              <Badge variant={badgeVariant} className={badgeClass}>
+                {icon}
+                {text}
+              </Badge>
             </div>
           )
         },

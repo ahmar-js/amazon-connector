@@ -118,3 +118,24 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* Custom Dialog Width Override */
+@layer components {
+  .dialog-wide {
+    width: 95vw !important;
+    max-width: 1600px !important;
+    min-width: 800px !important;
+  }
+  
+  /* Force override of default dialog constraints */
+  [data-slot="dialog-content"] {
+    width: unset !important;
+    max-width: unset !important;
+  }
+  
+  [data-slot="dialog-content"].dialog-wide {
+    width: 95vw !important;
+    max-width: 1600px !important;
+    min-width: 800px !important;
+  }
+}

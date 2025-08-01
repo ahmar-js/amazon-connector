@@ -14,6 +14,7 @@ from django.views.decorators.csrf import csrf_exempt
 from datetime import datetime, timedelta, timezone
 import time
 import os
+import pytz
 from pathlib import Path
 import math
 from typing import Dict, List, Optional, Tuple, Union
@@ -25,6 +26,7 @@ from .models import Activities
 from .simple_db_save import save_simple
 from django.core.paginator import Paginator
 from django.db.models import Q
+import random
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -829,30 +831,28 @@ class TestConnectionView(View):
 @method_decorator(csrf_exempt, name='dispatch')
 class FetchAmazonDataView(View):
     """
-    Efficient Amazon data fetching with proper SP-API rate limiting and batch processing.
+    Optimized Amazon data fetching with enhanced rate limiting and error handling for long-running operations.
     
     This view handles fetching orders and order items from Amazon SP-API with strict adherence
-    to Amazon's official rate limits and proper error handling. It implements the official
-    Amazon SP-API rate limits as of 2024:
+    to Amazon's official rate limits and enhanced error handling for month-long data fetching.
     
+    Official Amazon SP-API rate limits (2024):
     - Orders (getOrders): 0.0167 requests/second (1 request every 60 seconds) with burst of 20
     - Order Items (getOrderItems): 0.5 requests/second (1 request every 2 seconds) with burst of 30
     
     Key Features:
-    - Separate rate limiters for orders and order items with burst support
-    - Conservative batch processing with proper delays
-    - Minimal concurrent requests to prevent overwhelming the API
-    - Comprehensive error handling and retries
-    - Date range validation and formatting
-    - Marketplace-specific endpoint handling
-    - Detailed logging for rate limiting and API calls
+    - Official rate limits with intelligent burst management
+    - Exponential backoff with jitter for retries
+    - Circuit breaker pattern for consecutive failures
+    - Adaptive batch sizing based on error patterns
+    - Resume capability for long operations
+    - Enhanced error categorization and handling
     """
     
     # In-memory cache for processed data (temporary storage)
     _processed_data_cache = {}
     
     # Amazon SP-API endpoints for different marketplaces
-    # Each marketplace ID maps to its corresponding regional API endpoint
     SP_API_BASE_URLS = {
         # North America
         "ATVPDKIKX0DER": "https://sellingpartnerapi-na.amazon.com",  # US
@@ -869,125 +869,192 @@ class FetchAmazonDataView(View):
     ORDERS_ENDPOINT = "/orders/v0/orders"
     ORDER_ITEMS_ENDPOINT = "/orders/v0/orders/{order_id}/orderItems"
     
-    # Rate limiting and optimization settings based on Amazon SP-API official documentation
-    # Orders API Rate Limits (as of 2024):
-    # - getOrders: 0.0167 requests/second (1 request every 60 seconds) with burst of 20
-    # - getOrderItems: 0.5 requests/second (1 request every 2 seconds) with burst of 30
+    # Official Amazon SP-API rate limits (as of 2024)
     ORDERS_MAX_REQUESTS_PER_SECOND = 0.0167  # 1 request every 60 seconds
-    # Reduced order items rate to be more conservative (3 seconds between requests instead of 2)
-    ORDER_ITEMS_MAX_REQUESTS_PER_SECOND = 0.33  # 1 request every 3 seconds
+    ORDER_ITEMS_MAX_REQUESTS_PER_SECOND = 0.5  # 1 request every 2 seconds
 
-    # Burst limits from Amazon documentation - reduced to be more conservative
-    ORDERS_BURST_LIMIT = 10  # Reduced from 20
-    ORDER_ITEMS_BURST_LIMIT = 15  # Reduced from 30
+    # Official burst limits from Amazon documentation
+    ORDERS_BURST_LIMIT = 20
+    ORDER_ITEMS_BURST_LIMIT = 30
 
-    # Process orders in smaller batches to respect rate limits
-    # Further reduced to 3 orders per batch to be ultra-conservative with rate limits
-    BATCH_SIZE = 3
-
-    # Maximum number of concurrent requests for order items
-    # Keep at 1 to ensure we don't overwhelm the rate limits
-    MAX_CONCURRENT_REQUESTS = 1
-
-    # Timeout for API requests in seconds
-    REQUEST_TIMEOUT = 60  # Increased timeout for better reliability
+    # Adaptive batch processing parameters (made more conservative)
+    INITIAL_BATCH_SIZE = 2  # Start with smaller batches (reduced from 5)
+    MIN_BATCH_SIZE = 1
+    MAX_BATCH_SIZE = 5  # Reduced maximum (was 10)
     
-    class TokenBucketRateLimiter:
+    # Circuit breaker parameters (more sensitive)
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5  # Lower threshold (was 10)
+    CIRCUIT_BREAKER_RECOVERY_TIMEOUT = 600  # Longer recovery (10 minutes, was 5)
+    
+    # Enhanced retry parameters (more conservative)
+    MAX_RETRIES = 3  # Reduced from 5 to prevent excessive retries
+    BASE_RETRY_DELAY = 5  # Increased base delay (was 2)
+    MAX_RETRY_DELAY = 600  # Increased max delay (10 minutes, was 5)
+    JITTER_RANGE = 0.2  # Increased jitter (±20%, was ±10%)
+
+    # Timeout for API requests in seconds (more generous)
+    REQUEST_TIMEOUT = 120  # Increased from 90 seconds
+    
+    class EnhancedTokenBucketRateLimiter:
         """
-        Enhanced token bucket rate limiter implementation for Amazon SP-API.
+        Enhanced token bucket rate limiter with burst management and monitoring.
         
-        This class implements the token bucket algorithm with burst support to ensure we don't exceed
-        Amazon's rate limits. It maintains a bucket of tokens that are consumed for each request 
-        and refilled at a constant rate, with support for burst limits.
-        
-        Attributes:
-            rate_limit (float): Number of requests allowed per second
-            burst_limit (int): Maximum number of tokens in the bucket (burst capacity)
-            tokens (float): Current number of tokens in the bucket
-            last_update (float): Timestamp of last token update
-            lock (threading.Lock): Thread lock for thread-safe operations
+        This implementation includes:
+        - Official Amazon SP-API rate limits
+        - Intelligent burst management
+        - Rate limit monitoring and logging
+        - Adaptive throttling based on API responses
         """
         def __init__(self, rate_limit: float, burst_limit: int = 1):
-            """
-            Initialize the rate limiter.
-            
-            Args:
-                rate_limit (float): Number of requests allowed per second
-                burst_limit (int): Maximum number of tokens in the bucket
-            """
             self.rate_limit = rate_limit
             self.burst_limit = burst_limit
             self.tokens = float(burst_limit)  # Start with a full bucket
             self.last_update = time.time()
             self.lock = threading.Lock()
-            logger.info(f"Initialized rate limiter: {rate_limit} req/sec, burst: {burst_limit}")
+            self.total_requests = 0
+            self.throttled_requests = 0
+            logger.info(f"🚀 Initialized enhanced rate limiter: {rate_limit} req/sec, burst: {burst_limit}")
         
-        def acquire(self):
+        def acquire(self, priority: str = "normal"):
             """
-            Acquire a token for making a request.
+            Acquire a token with priority support and enhanced monitoring.
             
-            This method will wait if necessary until a token is available.
-            It uses the token bucket algorithm to ensure we don't exceed
-            the rate limit, with proper burst handling.
+            Args:
+                priority: "high", "normal", or "low" - affects waiting behavior
             """
             with self.lock:
                 now = time.time()
-                # Calculate time passed since last update
                 time_passed = now - self.last_update
+                
                 # Add new tokens based on time passed
                 new_tokens = time_passed * self.rate_limit
-                # Update token count, but don't exceed burst limit
                 self.tokens = min(float(self.burst_limit), self.tokens + new_tokens)
                 self.last_update = now
                 
+                self.total_requests += 1
+                
                 if self.tokens < 1.0:
-                    # If we don't have enough tokens, calculate wait time
-                    wait_time = (1.0 - self.tokens) / self.rate_limit
-                    logger.info(f"Rate limiting: waiting {wait_time:.2f}s for token")
+                    # Calculate wait time with priority adjustment
+                    base_wait_time = (1.0 - self.tokens) / self.rate_limit
+                    
+                    # Adjust wait time based on priority
+                    if priority == "high":
+                        wait_time = base_wait_time * 0.9  # 10% less wait for high priority
+                    elif priority == "low":
+                        wait_time = base_wait_time * 1.2  # 20% more wait for low priority
+                    else:
+                        wait_time = base_wait_time
+                    
+                    self.throttled_requests += 1
+                    throttle_rate = (self.throttled_requests / self.total_requests) * 100
+                    
+                    logger.info(f"⏳ Rate limiting: waiting {wait_time:.2f}s (throttle rate: {throttle_rate:.1f}%)")
                     time.sleep(wait_time)
                     self.tokens = 0.0
                 else:
-                    # If we have enough tokens, use one
                     self.tokens -= 1.0
-                    logger.debug(f"Token acquired, remaining: {self.tokens:.2f}")
+                    
+                # Log usage statistics periodically
+                if self.total_requests % 50 == 0:
+                    throttle_rate = (self.throttled_requests / self.total_requests) * 100
+                    logger.info(f"📊 Rate limiter stats: {self.total_requests} requests, {throttle_rate:.1f}% throttled")
         
         def get_wait_time(self):
-            """
-            Get the estimated wait time until next token is available.
-            
-            Returns:
-                float: Wait time in seconds
-            """
+            """Get estimated wait time until next token is available."""
             with self.lock:
                 if self.tokens >= 1.0:
                     return 0.0
                 return (1.0 - self.tokens) / self.rate_limit
     
-    def __init__(self):
+        def get_stats(self):
+            """Get rate limiter statistics."""
+            with self.lock:
+                throttle_rate = (self.throttled_requests / max(self.total_requests, 1)) * 100
+                return {
+                    'total_requests': self.total_requests,
+                    'throttled_requests': self.throttled_requests,
+                    'throttle_rate': throttle_rate,
+                    'current_tokens': self.tokens,
+                    'burst_limit': self.burst_limit
+                }
+
+    class CircuitBreaker:
         """
-        Initialize the view with a session and separate rate limiters.
+        Circuit breaker pattern implementation for handling consecutive failures.
+        """
+        def __init__(self, failure_threshold: int, recovery_timeout: int):
+            self.failure_threshold = failure_threshold
+            self.recovery_timeout = recovery_timeout
+            self.failure_count = 0
+            self.last_failure_time = None
+            self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+            self.lock = threading.Lock()
         
-        Sets up a requests session with default headers and initializes
-        separate rate limiters for orders and order items endpoints.
-        """
+        def call(self, func, *args, **kwargs):
+            """Execute function with circuit breaker protection."""
+            with self.lock:
+                if self.state == "OPEN":
+                    if self.last_failure_time is not None and time.time() - self.last_failure_time > self.recovery_timeout:
+                        self.state = "HALF_OPEN"
+                        logger.info("🔄 Circuit breaker: Attempting recovery (HALF_OPEN)")
+                    else:
+                        logger.warning("⚡ Circuit breaker: OPEN - blocking request")
+                        raise Exception("Circuit breaker is OPEN")
+                
+                try:
+                    result = func(*args, **kwargs)
+                    if self.state == "HALF_OPEN":
+                        self.state = "CLOSED"
+                        self.failure_count = 0
+                        logger.info("✅ Circuit breaker: Recovery successful (CLOSED)")
+                    return result
+                except Exception as e:
+                    self.failure_count += 1
+                    self.last_failure_time = time.time()
+                    
+                    if self.failure_count >= self.failure_threshold:
+                        self.state = "OPEN"
+                        logger.error(f"💥 Circuit breaker: OPEN after {self.failure_count} failures")
+                    
+                    raise
+    
+    def __init__(self):
+        """Initialize the view with enhanced rate limiters and circuit breaker."""
         super().__init__()
-        # Create a session for making HTTP requests
+        
+        # Create session for HTTP requests
         self.session = requests.Session()
-        # Set default headers for all requests
         self.session.headers.update({
             'User-Agent': 'AmazonConnector/1.0',
             'Accept': 'application/json',
             'Content-Type': 'application/json'
         })
-        # Initialize separate rate limiters for different endpoints
-        self.orders_rate_limiter = self.TokenBucketRateLimiter(
+        
+        # Initialize enhanced rate limiters with official Amazon limits
+        self.orders_rate_limiter = self.EnhancedTokenBucketRateLimiter(
             self.ORDERS_MAX_REQUESTS_PER_SECOND, 
             self.ORDERS_BURST_LIMIT
         )
-        self.order_items_rate_limiter = self.TokenBucketRateLimiter(
+        self.order_items_rate_limiter = self.EnhancedTokenBucketRateLimiter(
             self.ORDER_ITEMS_MAX_REQUESTS_PER_SECOND, 
             self.ORDER_ITEMS_BURST_LIMIT
         )
+        
+        # Initialize circuit breaker
+        self.circuit_breaker = self.CircuitBreaker(
+            self.CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            self.CIRCUIT_BREAKER_RECOVERY_TIMEOUT
+        )
+        
+        # Adaptive batch sizing
+        self.current_batch_size = self.INITIAL_BATCH_SIZE
+        self.consecutive_batch_successes = 0
+        self.consecutive_batch_failures = 0
+        
+        # Token refresh synchronization
+        self.token_refresh_lock = threading.Lock()
+        self.last_token_refresh_time = 0
+        self.token_refresh_cooldown = 30  # Seconds to wait before allowing another refresh
     
     def post(self, request, *args, **kwargs):
         """
@@ -1036,6 +1103,7 @@ class FetchAmazonDataView(View):
             end_date = data['end_date'].strip()
             max_orders = data.get('max_orders')
             auto_save = data.get('auto_save', False)  # Get auto_save parameter
+            logger.info(f"🔍 Start date: {start_date}, End date: {end_date}")
             
             # Debug logging
             logger.info(f"🔍 Request parameters: marketplace_id={marketplace_id}, auto_save={auto_save}")
@@ -1052,9 +1120,20 @@ class FetchAmazonDataView(View):
                     start_date = f"{start_date}T00:00:00Z"
                 if 'T' not in end_date:
                     end_date = f"{end_date}T23:59:59Z"
+                logger.info(f"🔍 Start date: {start_date}, End date: {end_date}")
                 
-                start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-                end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                # start_dt = datetime.fromisoformat(start_date.replace('Z', ''))
+                # end_dt = datetime.fromisoformat(end_date.replace('Z', ''))
+                # logger.info(f"🔍 Start date: {start_dt}, End date: {end_dt}")
+                if marketplace_id == "A1F83G8C2ARO7P":
+                    start_dt_str, end_dt_str = self.convert_dates(start_date, end_date, "UK")
+                else:
+                    start_dt_str, end_dt_str = self.convert_dates(start_date, end_date, "IT")
+                # Convert result back to datetime
+                start_dt = datetime.fromisoformat(start_dt_str.replace('Z', ''))
+                end_dt = datetime.fromisoformat(end_dt_str.replace('Z', ''))
+                logger.info(f"🔍 Start date: {start_dt}, End date: {end_dt}")
+
             except ValueError as e:
                 return JsonResponse({
                     'success': False,
@@ -1078,7 +1157,9 @@ class FetchAmazonDataView(View):
                     'error': 'Date range too large',
                     'details': 'Please limit date range to 30 days maximum for optimal performance'
                 }, status=400)
-            
+            # Convert to ISO format with Z suffix for Amazon API
+            start_date = start_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+            end_date = end_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
             logger.info(f"Starting Amazon data fetch: {marketplace_id}, {start_date} to {end_date}")
             
             # Create or get existing activity record to prevent duplicates
@@ -1132,6 +1213,7 @@ class FetchAmazonDataView(View):
             
             # Start fetching data
             fetch_start_time = time.time()
+            logger.info("I am here")
             result = self.fetch_orders_with_items(
                 headers, 
                 base_url,
@@ -1350,17 +1432,33 @@ class FetchAmazonDataView(View):
                         # Create detailed message including database save info
                         detail_message = f'Successfully fetched {total_orders} orders and {total_items} items in {total_duration:.1f}s'
                         if auto_save and db_save_result:
+                            # Update separate database save status fields
+                            activity.mssql_saved = db_save_result.get('mssql_success', False)
+                            activity.azure_saved = db_save_result.get('azure_success', False)
+                            activity.database_saved = db_save_result['success']  # Keep original for backward compatibility
+                            
                             if db_save_result['success']:
+                                # At least one database save succeeded
                                 detail_message += f' | Auto-saved {db_save_result["total_records_saved"]} records to databases'
-                                activity.database_saved = True
+                                if activity.mssql_saved and activity.azure_saved:
+                                    detail_message += ' (MSSQL: ✓, Azure: ✓)'
+                                elif activity.mssql_saved:
+                                    detail_message += ' (MSSQL: ✓, Azure: ✗)'
+                                elif activity.azure_saved:
+                                    detail_message += ' (MSSQL: ✗, Azure: ✓)'
                             else:
+                                # Both database saves failed
                                 detail_message += f' | Auto-save failed: {db_save_result.get("error", "Unknown error")}'
-                                activity.database_saved = False
+                                detail_message += ' (MSSQL: ✗, Azure: ✗)'
                         elif auto_save:
                             detail_message += ' | Auto-save was attempted but no save result available'
                             activity.database_saved = False
+                            activity.mssql_saved = False
+                            activity.azure_saved = False
                         else:
                             activity.database_saved = False
+                            activity.mssql_saved = False
+                            activity.azure_saved = False
                         
                         activity.detail = detail_message
                         activity.save()
@@ -1411,6 +1509,36 @@ class FetchAmazonDataView(View):
                 'error': 'Unexpected error occurred',
                 'details': 'An unexpected error occurred while fetching Amazon data'
             }, status=500)
+
+    def convert_dates(self, start_date_str: str, end_date_str: str, marketplace: str):
+        """
+        Convert both start and end dates from local timezones to UTC:
+        - UK: assumes input is in GMT/BST (Europe/London)
+        - Others: assumes input is in MET (Europe/Paris)
+        Returns ISO 8601 format strings ending with 'Z'.
+        """
+
+        # Parse naive datetime
+        start_naive = datetime.fromisoformat(start_date_str.replace('Z', ''))
+        end_naive = datetime.fromisoformat(end_date_str.replace('Z', ''))
+
+        # Timezones
+        london = pytz.timezone('Europe/London')  # Handles BST/GMT transitions
+        met = pytz.timezone('Europe/Paris')
+        utc = pytz.utc
+
+        if marketplace.upper() == 'UK':
+            start_utc = london.localize(start_naive).astimezone(utc)
+            end_utc = london.localize(end_naive).astimezone(utc)
+        else:
+            start_utc = met.localize(start_naive).astimezone(utc)
+            end_utc = met.localize(end_naive).astimezone(utc)
+
+        # Return ISO 8601 strings ending with 'Z'
+        return (
+            start_utc.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+        )
     
     def fetch_orders_with_items(
         self, 
@@ -1596,11 +1724,10 @@ class FetchAmazonDataView(View):
     
     def fetch_order_items_batch(self, headers: Dict[str, str], base_url: str, orders: List[Dict]) -> Dict:
         """
-        Fetch order items for a batch of orders with conservative rate limiting.
+        Enhanced order items fetching with adaptive batch sizing and automatic retry for failed orders.
         
-        This method processes orders in small batches to strictly respect Amazon's rate limits.
-        It uses minimal concurrency and adds proper delays between batches to prevent
-        overwhelming the API.
+        This method now automatically retries failed orders using the fetch_missing_order_items function
+        to ensure 100% success rate for sensitive applications.
         
         Args:
             headers (Dict[str, str]): Request headers including access token
@@ -1613,31 +1740,431 @@ class FetchAmazonDataView(View):
         all_items = {}
         failed_orders = []
         total_orders = len(orders)
-        consecutive_rate_limits = 0  # Track consecutive rate limit errors
+        consecutive_rate_limits = 0
         
-        logger.info(f"Starting order items fetch for {total_orders} orders with batch size {self.BATCH_SIZE}")
+        logger.info(f"🚀 Starting order items fetch for {total_orders} orders with adaptive batch sizing and auto-retry")
         
-        # Calculate estimated time with new conservative rates
-        num_batches = (total_orders + self.BATCH_SIZE - 1) // self.BATCH_SIZE
-        # Each order item request takes ~3 seconds due to rate limiting, plus 10 seconds between batches
-        estimated_minutes = ((total_orders * 3) + ((num_batches - 1) * 10)) / 60
-        logger.info(f"Estimated processing time: {estimated_minutes:.1f} minutes for {num_batches} batches")
+        # Calculate estimated time with current batch size
+        estimated_time = self._calculate_estimated_time(total_orders)
+        logger.info(f"⏱️ Estimated processing time: {estimated_time}")
         
-        # Process orders in smaller batches to respect rate limits
-        for batch_num, i in enumerate(range(0, len(orders), self.BATCH_SIZE), 1):
-            batch = orders[i:i + self.BATCH_SIZE]
-            batch_size = len(batch)
+        # Step 1: Process orders with adaptive batch sizing (main fetch)
+        processed_orders = 0
+        
+        while processed_orders < total_orders:
+            # Determine current batch
+            remaining_orders = total_orders - processed_orders
+            current_batch_size = min(self.current_batch_size, remaining_orders)
             
-            logger.info(f"Processing batch {batch_num}: orders {i+1}-{i+batch_size} of {total_orders}")
+            batch_start = processed_orders
+            batch_end = processed_orders + current_batch_size
+            batch = orders[batch_start:batch_end]
             
-            # Use ThreadPoolExecutor with minimal concurrency
-            with ThreadPoolExecutor(max_workers=self.MAX_CONCURRENT_REQUESTS) as executor:
+            batch_num = (processed_orders // current_batch_size) + 1
+            total_batches = math.ceil(total_orders / current_batch_size)
+            
+            logger.info(f"📦 Processing batch {batch_num}/{total_batches}: orders {batch_start+1}-{batch_end} (batch size: {current_batch_size})")
+            
+            try:
+                # Process batch with circuit breaker protection
+                batch_result = self.circuit_breaker.call(
+                    self._process_order_items_batch,
+                    headers, base_url, batch
+                )
+                
+                # Handle batch results
+                batch_items = batch_result.get('items', {})
+                batch_failures = batch_result.get('failed_orders', [])
+                
+                all_items.update(batch_items)
+                failed_orders.extend(batch_failures)
+                
+                # Update adaptive batch sizing based on success
+                self._update_batch_size_on_success(batch_failures, len(batch))
+                consecutive_rate_limits = 0
+                
+                processed_orders = batch_end
+                
+                # Log progress
+                progress = (processed_orders / total_orders) * 100
+                logger.info(f"✅ Batch {batch_num} completed. Progress: {progress:.1f}% ({processed_orders}/{total_orders})")
+                
+            except Exception as batch_error:
+                logger.error(f"❌ Batch {batch_num} failed: {batch_error}")
+                
+                # Handle batch failure
+                self._update_batch_size_on_failure()
+                
+                # Add all orders in failed batch to failed_orders
+                for order in batch:
+                            failed_orders.append({
+                                'order_id': order['AmazonOrderId'],
+                        'error': f'Batch processing failed: {str(batch_error)}'
+                    })
+                
+                processed_orders = batch_end
+                consecutive_rate_limits += 1
+                
+                # If too many consecutive failures, add progressive delay
+                if consecutive_rate_limits > 3:
+                    progressive_delay = min(consecutive_rate_limits * 30, 300)  # Cap at 5 minutes
+                    logger.warning(f"⚠️ Multiple consecutive failures, adding {progressive_delay}s delay")
+                    time.sleep(progressive_delay)
+            
+            # Add delay between batches (more conservative)
+            if processed_orders < total_orders:
+                batch_delay = self._calculate_batch_delay(consecutive_rate_limits)
+                logger.info(f"⏸️ Batch completed. Waiting {batch_delay}s before next batch...")
+                time.sleep(batch_delay)
+        
+        # Step 2: Auto-retry failed orders for 100% success rate
+        if failed_orders:
+            failed_order_ids = [f['order_id'] for f in failed_orders]
+            logger.warning(f"🔄 AUTO-RETRY: {len(failed_orders)} orders failed in main fetch. Starting automatic retry...")
+            logger.info(f"📋 Failed Order IDs: {failed_order_ids[:10]}{'...' if len(failed_order_ids) > 10 else ''}")
+            
+            # Add a delay before starting auto-retry
+            logger.info("⏸️ Waiting 30s before starting auto-retry process...")
+            time.sleep(30)
+            
+            try:
+                # Use the existing fetch_missing_order_items method for auto-retry
+                retry_start_time = time.time()
+                retry_result = self.fetch_missing_order_items(headers, base_url, failed_order_ids)
+                retry_duration = time.time() - retry_start_time
+                
+                # Debug: Log what was actually returned
+                logger.info(f"🔍 DEBUG: fetch_missing_order_items returned: {type(retry_result)}, value: {retry_result is not None}")
+                if retry_result is not None:
+                    logger.info(f"🔍 DEBUG: Return keys: {list(retry_result.keys()) if isinstance(retry_result, dict) else 'Not a dict'}")
+                
+                # Update results with successful retries
+                retry_items = retry_result.get('items', {})
+                remaining_failed = retry_result.get('failed_orders', [])
+                
+                all_items.update(retry_items)
+                
+                # Log retry results
+                retry_success = len(retry_items)
+                still_failed = len(remaining_failed)
+                
+                if still_failed == 0:
+                    logger.info(f"🎯 AUTO-RETRY SUCCESS: All {retry_success} failed orders successfully recovered in {retry_duration:.1f}s!")
+                    logger.info(f"✅ 100% SUCCESS RATE ACHIEVED: {len(all_items)}/{total_orders} orders fetched")
+                    failed_orders = []  # Clear failed orders since all were recovered
+                else:
+                    logger.warning(f"📊 AUTO-RETRY PARTIAL: {retry_success} orders recovered, {still_failed} still failed after {retry_duration:.1f}s")
+                    failed_orders = remaining_failed  # Update with remaining failures
+                    
+                    # For ultra-critical applications, could add another retry round here
+                    logger.error(f"💥 CRITICAL: {still_failed} orders could not be fetched even after auto-retry")
+                    logger.error("🚨 Manual intervention may be required for remaining orders")
+                
+            except Exception as retry_error:
+                logger.error(f"💥 AUTO-RETRY FAILED: Error during automatic retry: {retry_error}")
+                # Keep original failed_orders list
+        
+        # Log final statistics
+        success_rate = ((total_orders - len(failed_orders)) / total_orders) * 100 if total_orders > 0 else 0
+        final_status = "PERFECT" if len(failed_orders) == 0 else "PARTIAL"
+        
+        logger.info(f"🏁 Order items fetch completed. Status: {final_status}")
+        logger.info(f"📊 Final Results: {len(all_items)}/{total_orders} orders ({success_rate:.1f}% success rate)")
+        
+        if len(failed_orders) == 0:
+            logger.info("🎯 MISSION ACCOMPLISHED: 100% success rate achieved!")
+        else:
+            logger.error(f"❌ {len(failed_orders)} orders still failed after all retry attempts")
+        
+        # Log rate limiter statistics
+        orders_stats = self.orders_rate_limiter.get_stats()
+        items_stats = self.order_items_rate_limiter.get_stats()
+        logger.info(f"📊 Orders rate limiter: {orders_stats}")
+        logger.info(f"📊 Items rate limiter: {items_stats}")
+        
+        return {
+            'success': True,
+            'items': all_items,
+            'failed_orders': failed_orders,
+            'statistics': {
+                'total_orders': total_orders,
+                'successful_orders': len(all_items),
+                'failed_orders': len(failed_orders),
+                'success_rate': success_rate,
+                'final_batch_size': self.current_batch_size,
+                'auto_retry_performed': True,  # Indicate that auto-retry was attempted
+                'orders_rate_stats': orders_stats,
+                'items_rate_stats': items_stats
+            }
+        }
+    
+    def fetch_missing_order_items(self, headers: Dict[str, str], base_url: str, order_ids: List[str]) -> Dict:
+        """
+        Fetch order items for specific missing orders by their IDs.
+        
+        This is a specialized function for fetching order items for orders that failed
+        in the main batch processing. It uses a more conservative, single-order approach
+        for maximum reliability.
+        
+        Args:
+            headers (Dict[str, str]): Request headers including access token
+            base_url (str): Base URL for the marketplace's API endpoint
+            order_ids (List[str]): List of Amazon Order IDs to fetch items for
+            
+        Returns:
+            Dict: Contains the fetched items, success statistics, and any remaining failures
+        """
+        try:
+            if not order_ids:
+                return {
+                    'success': True,
+                    'items': {},
+                    'failed_orders': [],
+                    'statistics': {
+                        'total_requested': 0,
+                        'successful_orders': 0,
+                        'failed_orders': 0,
+                        'success_rate': 100.0
+                    }
+                }
+            
+            logger.info(f"🎯 Starting targeted fetch for {len(order_ids)} missing order items")
+            logger.info(f"📋 Order IDs: {order_ids[:5]}{'...' if len(order_ids) > 5 else ''}")
+            
+            fetched_items = {}
+            failed_orders = []
+            
+            # Use single-order processing for maximum reliability
+            for i, order_id in enumerate(order_ids, 1):
+                logger.info(f"📦 Fetching items for order {i}/{len(order_ids)}: {order_id}")
+                
+                try:
+                    # Create minimal order object
+                    order = {'AmazonOrderId': order_id}
+                    
+                    # Fetch with enhanced retry logic
+                    result = self.fetch_single_order_items_with_retry(headers, base_url, order)
+                    
+                    if result['success']:
+                        fetched_items[order_id] = result['items']
+                        logger.info(f"✅ Order {order_id}: {len(result['items'])} items fetched")
+                    else:
+                        failed_orders.append({
+                            'order_id': order_id,
+                            'error': result.get('error', 'Unknown error')
+                        })
+                        logger.warning(f"❌ Order {order_id}: {result.get('error', 'Failed')}")
+                    
+                    # Add delay between single orders to be extra conservative
+                    if i < len(order_ids):
+                        delay = 5 + (len(failed_orders) * 2)  # Increase delay if failures occur
+                        logger.debug(f"⏸️ Waiting {delay}s before next order...")
+                        time.sleep(delay)
+                        
+                except Exception as e:
+                    logger.error(f"💥 Unexpected error fetching order {order_id}: {e}")
+                    failed_orders.append({
+                        'order_id': order_id,
+                        'error': f'Unexpected error: {str(e)}'
+                    })
+            
+            # Calculate statistics
+            total_requested = len(order_ids)
+            successful_count = len(fetched_items)
+            failed_count = len(failed_orders)
+            success_rate = (successful_count / total_requested) * 100 if total_requested > 0 else 0
+            
+            # Log results
+            if failed_count == 0:
+                logger.info(f"🎯 PERFECT! All {successful_count} missing orders fetched successfully (100% success rate)")
+            else:
+                logger.warning(f"📊 Missing orders fetch completed: {successful_count}/{total_requested} succeeded ({success_rate:.1f}%), {failed_count} still failed")
+                
+                if failed_count > 0:
+                    logger.error(f"💥 Still failing orders:")
+                    for failed in failed_orders:
+                        logger.error(f"    ❌ {failed['order_id']}: {failed['error']}")
+            
+            # Debug: Log before return to trace execution
+            logger.info(f"🔍 DEBUG: About to return from fetch_missing_order_items - successful_count: {successful_count}, failed_count: {failed_count}")
+            
+            return {
+                'success': True,
+                'items': fetched_items,
+                'failed_orders': failed_orders,
+                'statistics': {
+                    'total_requested': total_requested,
+                    'successful_orders': successful_count,
+                    'failed_orders': failed_count,
+                    'success_rate': success_rate
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"💥 CRITICAL: Unexpected exception in fetch_missing_order_items: {e}")
+            logger.error(f"💥 CRITICAL: Exception type: {type(e)}")
+            logger.error(f"💥 CRITICAL: This caused the method to return None implicitly")
+            import traceback
+            logger.error(f"💥 CRITICAL: Traceback: {traceback.format_exc()}")
+            
+            # Return a safe default instead of None
+            return {
+                'success': False,
+                'items': {},
+                'failed_orders': [{'order_id': 'unknown', 'error': f'Critical exception: {str(e)}'}],
+                'statistics': {
+                    'total_requested': len(order_ids) if order_ids else 0,
+                    'successful_orders': 0,
+                    'failed_orders': len(order_ids) if order_ids else 0,
+                    'success_rate': 0.0
+                }
+            }
+    
+    def _retry_failed_orders(self, headers: Dict[str, str], base_url: str, all_orders: List[Dict], failed_orders: List[Dict], existing_items: Dict) -> Tuple[Dict, List[Dict]]:
+        """
+        Retry failed orders with progressive backoff until 100% success rate is achieved.
+        
+        Args:
+            headers (Dict[str, str]): Request headers
+            base_url (str): API base URL
+            all_orders (List[Dict]): Original list of all orders
+            failed_orders (List[Dict]): List of failed order info
+            existing_items (Dict): Already successfully fetched items
+            
+        Returns:
+            Tuple[Dict, List[Dict]]: Updated items dict and remaining failed orders
+        """
+        MAX_RETRY_ROUNDS = 5  # Maximum number of retry rounds
+        RETRY_DELAY_BASE = 60  # Base delay between retry rounds in seconds
+        
+        # Create order lookup dictionary for quick access
+        order_lookup = {order['AmazonOrderId']: order for order in all_orders}
+        
+        current_failed = failed_orders.copy()
+        all_items = existing_items.copy()
+        
+        for retry_round in range(1, MAX_RETRY_ROUNDS + 1):
+            if not current_failed:
+                break
+                
+            logger.info(f"🔄 RETRY ROUND {retry_round}/{MAX_RETRY_ROUNDS}: Attempting to fetch {len(current_failed)} failed orders")
+            
+            # Create list of order objects for retry
+            retry_orders = []
+            for failed_info in current_failed:
+                order_id = failed_info['order_id']
+                if order_id in order_lookup:
+                    retry_orders.append(order_lookup[order_id])
+                else:
+                    logger.warning(f"⚠️ Order {order_id} not found in original order list")
+            
+            if not retry_orders:
+                logger.error("❌ No valid orders found for retry")
+                break
+            
+            # Progressive delay before retry (except first round)
+            if retry_round > 1:
+                delay = RETRY_DELAY_BASE * retry_round
+                logger.info(f"⏸️ Waiting {delay}s before retry round {retry_round}...")
+                time.sleep(delay)
+            
+            # Use smaller, more conservative batch size for retries
+            original_batch_size = self.current_batch_size
+            self.current_batch_size = max(1, self.current_batch_size // 2)  # Halve batch size for retries
+            
+            # Process retry orders
+            retry_items = {}
+            new_failed = []
+            
+            try:
+                # Process in smaller batches with extra care
+                for i in range(0, len(retry_orders), self.current_batch_size):
+                    batch = retry_orders[i:i + self.current_batch_size]
+                    batch_num = (i // self.current_batch_size) + 1
+                    total_retry_batches = math.ceil(len(retry_orders) / self.current_batch_size)
+                    
+                    logger.info(f"📦 Retry batch {batch_num}/{total_retry_batches}: Processing {len(batch)} orders")
+                    
+                    try:
+                        batch_result = self._process_order_items_batch(headers, base_url, batch)
+                        
+                        # Collect results
+                        batch_items = batch_result.get('items', {})
+                        batch_failures = batch_result.get('failed_orders', [])
+                        
+                        retry_items.update(batch_items)
+                        new_failed.extend(batch_failures)
+                        
+                        # Add delay between retry batches
+                        if i + self.current_batch_size < len(retry_orders):
+                            logger.info(f"⏸️ Retry batch delay: 30s...")
+                            time.sleep(30)
+                            
+                    except Exception as batch_error:
+                        logger.error(f"❌ Retry batch {batch_num} failed: {batch_error}")
+                        # Add all orders in failed batch to new_failed
+                        for order in batch:
+                            new_failed.append({
+                                'order_id': order['AmazonOrderId'],
+                                'error': f'Retry batch failed: {str(batch_error)}'
+                            })
+                
+            finally:
+                # Restore original batch size
+                self.current_batch_size = original_batch_size
+            
+            # Update results
+            all_items.update(retry_items)
+            
+            # Log round results
+            round_success = len(retry_orders) - len(new_failed)
+            round_success_rate = (round_success / len(retry_orders)) * 100 if retry_orders else 0
+            
+            logger.info(f"✅ Retry round {retry_round} completed: {round_success}/{len(retry_orders)} succeeded ({round_success_rate:.1f}%)")
+            
+            if len(new_failed) == 0:
+                logger.info(f"🎯 100% success achieved in retry round {retry_round}!")
+                current_failed = []
+                break
+            elif len(new_failed) < len(current_failed):
+                logger.info(f"📈 Progress made: {len(current_failed) - len(new_failed)} additional orders fetched")
+                current_failed = new_failed
+            else:
+                logger.warning(f"⚠️ No progress in retry round {retry_round}. Same failures persist.")
+                current_failed = new_failed
+        
+        # Final summary
+        if current_failed:
+            logger.error(f"💥 RETRY PROCESS FAILED: {len(current_failed)} orders could not be fetched after {MAX_RETRY_ROUNDS} retry rounds")
+            logger.error("🚨 CRITICAL: Unable to achieve 100% success rate. Manual intervention may be required.")
+        else:
+            logger.info(f"🎯 RETRY PROCESS SUCCESS: 100% success rate achieved after retry processing!")
+        
+        return all_items, current_failed
+    
+    def _process_order_items_batch(self, headers: Dict[str, str], base_url: str, batch: List[Dict]) -> Dict:
+        """
+        Process a single batch of orders for items fetching.
+        
+        Args:
+            headers (Dict[str, str]): Request headers
+            base_url (str): API base URL
+            batch (List[Dict]): Batch of orders to process
+            
+        Returns:
+            Dict: Batch processing results
+        """
+        batch_items = {}
+        batch_failures = []
+            
+        # Use ThreadPoolExecutor with conservative concurrency
+        max_workers = min(2, len(batch))  # Very conservative concurrency
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_order = {
                     executor.submit(
-                        self.fetch_single_order_items,
-                        headers,
-                        base_url,
-                        order
+                    self.fetch_single_order_items_with_retry,
+                    headers, base_url, order
                     ): order for order in batch
                 }
                 
@@ -1646,44 +2173,425 @@ class FetchAmazonDataView(View):
                     try:
                         result = future.result()
                         if result['success']:
-                            all_items[order['AmazonOrderId']] = result['items']
-                            consecutive_rate_limits = 0  # Reset counter on success
+                            batch_items[order['AmazonOrderId']] = result['items']
                         else:
-                            # Check if this was a rate limit error
-                            if 'rate limit' in result.get('error', '').lower() or 'too many requests' in result.get('error', '').lower():
-                                consecutive_rate_limits += 1
-                                logger.warning(f"Consecutive rate limits: {consecutive_rate_limits}")
-                            
-                            failed_orders.append({
+                            batch_failures.append({
                                 'order_id': order['AmazonOrderId'],
                                 'error': result.get('error', 'Unknown error')
                             })
                     except Exception as e:
-                        failed_orders.append({
+                        batch_failures.append({
                             'order_id': order['AmazonOrderId'],
-                            'error': str(e)
-                        })
-            
-            # Add longer delay between batches to be more conservative
-            if i + self.BATCH_SIZE < len(orders):
-                # Progressive delay based on consecutive rate limits
-                base_delay = 10  # Base 10 second delay
-                progressive_delay = consecutive_rate_limits * 5  # Add 5 seconds for each consecutive rate limit
-                delay_time = base_delay + progressive_delay
-                
-                if consecutive_rate_limits > 0:
-                    logger.warning(f"Adding {progressive_delay}s extra delay due to {consecutive_rate_limits} consecutive rate limits")
-                
-                logger.info(f"Batch {batch_num} completed. Waiting {delay_time}s before next batch...")
-                time.sleep(delay_time)
-        
-        logger.info(f"Order items fetch completed. Success: {len(all_items)}, Failed: {len(failed_orders)}")
+                        'error': f'Future execution failed: {str(e)}'
+                    })
         
         return {
-            'success': True,
-            'items': all_items,
-            'failed_orders': failed_orders
+            'items': batch_items,
+            'failed_orders': batch_failures
         }
+    
+    def fetch_single_order_items_with_retry(self, headers: Dict[str, str], base_url: str, order: Dict) -> Dict:
+        """
+        Fetch items for a single order with enhanced retry logic.
+        
+        Args:
+            headers (Dict[str, str]): Request headers
+            base_url (str): API base URL
+            order (Dict): Order to fetch items for
+            
+        Returns:
+            Dict: Fetch result with enhanced error information
+        """
+        order_id = order['AmazonOrderId']
+        
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                result = self.fetch_single_order_items(headers, base_url, order)
+                return result
+            
+            except Exception as e:
+                error_str = str(e).lower()
+                
+                # Enhanced error categorization
+                if 'authentication failed' in error_str or 'auth' in error_str or '401' in error_str or '403' in error_str:
+                    error_type = "authentication"
+                    priority = "high"  # Authentication errors should be retried (token might be refreshed)
+                    # Don't fail fast on auth errors as they might be resolved by token refresh
+                elif '429' in error_str or 'rate limit' in error_str or 'too many requests' in error_str:
+                    error_type = "rate_limit"
+                    priority = "high"  # Rate limit errors get high priority for retry
+                elif '503' in error_str or 'service unavailable' in error_str:
+                    error_type = "service_unavailable"
+                    priority = "normal"
+                elif '500' in error_str or 'internal server error' in error_str:
+                    error_type = "server_error"
+                    priority = "normal"
+                elif 'timeout' in error_str or 'timed out' in error_str:
+                    error_type = "timeout"
+                    priority = "normal"
+                elif 'connection' in error_str or 'network' in error_str:
+                    error_type = "network"
+                    priority = "normal"
+                elif '400' in error_str or 'bad request' in error_str:
+                    error_type = "bad_request"
+                    priority = "low"  # Bad request errors are unlikely to succeed on retry
+                else:
+                    error_type = "unknown"
+                    priority = "low"
+                
+                # Some errors should not be retried (fail fast)
+                if error_type in ["bad_request"] and '400' in error_str:
+                    logger.error(f"❌ Order {order_id} failed with non-retryable error ({error_type}): {e}")
+                    return {
+                        'success': False,
+                        'error': f'Non-retryable error: {str(e)}',
+                        'error_type': error_type
+                    }
+                
+                if attempt < self.MAX_RETRIES - 1:
+                    # Calculate retry delay with exponential backoff and jitter
+                    base_delay = self.BASE_RETRY_DELAY * (2 ** attempt)
+                    jitter = base_delay * self.JITTER_RANGE * (random.random() * 2 - 1)  # Enhanced jitter
+                    retry_delay = min(base_delay + jitter, self.MAX_RETRY_DELAY)
+                    
+                    # Adjust delay based on error type
+                    if error_type == "rate_limit":
+                        retry_delay *= 3  # Triple the delay for rate limit errors (more conservative)
+                    elif error_type == "authentication":
+                        retry_delay *= 2  # Double delay for auth errors to allow token refresh
+                    elif error_type == "service_unavailable":
+                        retry_delay *= 2  # Double delay for service issues
+                    elif error_type == "network":
+                        retry_delay *= 1.5  # Slight increase for network issues
+                    
+                    logger.warning(f"⚠️ Order {order_id} attempt {attempt + 1} failed ({error_type}): {e}")
+                    logger.info(f"🔄 Retrying in {retry_delay:.1f}s...")
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(f"❌ Order {order_id} failed after {self.MAX_RETRIES} attempts ({error_type}): {e}")
+        
+        return {
+            'success': False,
+            'error': f'Maximum retries exceeded after {self.MAX_RETRIES} attempts',
+            'error_type': 'max_retries'
+        }
+    
+    def make_rate_limited_request(
+        self, 
+        method: str, 
+        url: str, 
+        headers: Dict[str, str], 
+        params: Optional[Dict] = None, 
+        data: Optional[Dict] = None,
+        is_order_items: bool = False,
+        allow_token_refresh: bool = True
+    ) -> requests.Response:
+        """
+        Enhanced rate-limited request with automatic token refresh and better error handling.
+        
+        Args:
+            method (str): HTTP method
+            url (str): Request URL
+            headers (Dict[str, str]): Request headers
+            params (Optional[Dict]): URL parameters
+            data (Optional[Dict]): Request body data
+            is_order_items (bool): Whether this is an order items request
+            allow_token_refresh (bool): Whether to attempt token refresh on auth failures
+            
+        Returns:
+            requests.Response: The API response
+        """
+        # Apply rate limiting with priority
+        priority = "high" if is_order_items else "normal"
+        
+        if is_order_items:
+            self.order_items_rate_limiter.acquire(priority)
+        else:
+            self.orders_rate_limiter.acquire(priority)
+        
+        try:
+            response = self.session.request(
+                method=method,
+                url=url,
+                headers=headers,
+                params=params,
+                json=data,
+                timeout=self.REQUEST_TIMEOUT
+            )
+                
+            # Log rate limit headers if available
+            if 'x-amzn-RateLimit-Limit' in response.headers:
+                rate_limit_info = response.headers['x-amzn-RateLimit-Limit']
+                logger.debug(f"📏 Amazon rate limit header: {rate_limit_info}")
+            
+            # Handle specific HTTP status codes
+            if response.status_code == 401 or response.status_code == 403:
+                if allow_token_refresh:
+                    logger.warning(f"🔑 Authentication failed (HTTP {response.status_code}), attempting token refresh...")
+                    
+                    # Attempt to refresh token
+                    refresh_result = self._refresh_token_and_retry()
+                    if refresh_result['success']:
+                        # Update headers with new token and retry the request
+                        new_headers = headers.copy()
+                        new_headers["x-amz-access-token"] = refresh_result['access_token']
+                        new_headers["x-amz-date"] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                        
+                        logger.info("🔄 Retrying request with refreshed token...")
+                        
+                        # Recursive call with token refresh disabled to avoid infinite loops
+                        return self.make_rate_limited_request(
+                            method, url, new_headers, params, data, is_order_items, allow_token_refresh=False
+                        )
+                    else:
+                        logger.error(f"❌ Token refresh failed: {refresh_result['error']}")
+                        raise requests.exceptions.RequestException(f"Authentication failed and token refresh failed: {refresh_result['error']}")
+                else:
+                    logger.error(f"🚫 Authentication failed (HTTP {response.status_code}) - token refresh already attempted")
+                    raise requests.exceptions.RequestException(f"Authentication failed (HTTP {response.status_code})")
+            
+            elif response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 60))
+                logger.warning(f"🚫 Rate limited by Amazon. Retry after: {retry_after}s")
+                time.sleep(retry_after + 5)  # Add 5 second buffer
+                raise requests.exceptions.RequestException(f"Rate limited (429), retry after {retry_after}s")
+            
+            elif response.status_code == 503:
+                retry_after = int(response.headers.get('Retry-After', 30))
+                logger.warning(f"🔧 Service unavailable. Retry after: {retry_after}s")
+                time.sleep(retry_after)
+                raise requests.exceptions.RequestException(f"Service unavailable (503), retry after {retry_after}s")
+            
+            elif response.status_code >= 500:
+                logger.warning(f"🚨 Server error: {response.status_code}")
+                raise requests.exceptions.RequestException(f"Server error: {response.status_code}")
+                
+            return response
+                
+        except requests.exceptions.Timeout:
+            logger.warning(f"⏰ Request timeout after {self.REQUEST_TIMEOUT}s")
+            raise requests.exceptions.RequestException("Request timeout")
+        
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"🔌 Connection error: {e}")
+            raise requests.exceptions.RequestException(f"Connection error: {e}")
+        
+        except requests.exceptions.RequestException:
+            raise  # Re-raise request exceptions as-is
+        
+        except Exception as e:
+            logger.error(f"💥 Unexpected error in request: {e}")
+            raise requests.exceptions.RequestException(f"Unexpected error: {e}")
+    
+    def _refresh_token_and_retry(self) -> Dict:
+        """
+        Internal method to refresh access token using stored credentials with synchronization.
+        
+        Returns:
+            Dict: Contains success status and new token data or error information
+        """
+        current_time = time.time()
+        
+        # Check if token was recently refreshed (within cooldown period)
+        if current_time - self.last_token_refresh_time < self.token_refresh_cooldown:
+            logger.info("🔄 Token was recently refreshed, using existing token")
+            try:
+                # Read the current token from file
+                creds_file_path = Path(__file__).parent.parent / 'creds.json'
+                if creds_file_path.exists():
+                    with open(creds_file_path, 'r') as f:
+                        creds_data = json.load(f)
+                    access_token = creds_data.get('access_token')
+                    if access_token:
+                        return {
+                            'success': True,
+                            'access_token': access_token,
+                            'token_type': creds_data.get('token_type', 'bearer'),
+                            'expires_in': creds_data.get('expires_in', 3600),
+                            'expires_at': creds_data.get('expires_at', '')
+                        }
+            except Exception as e:
+                logger.warning(f"Failed to read recent token: {e}")
+        
+        # Use lock to ensure only one thread refreshes at a time
+        with self.token_refresh_lock:
+            # Double-check if another thread just refreshed the token
+            if current_time - self.last_token_refresh_time < self.token_refresh_cooldown:
+                logger.info("🔄 Another thread refreshed token, using that result")
+                try:
+                    creds_file_path = Path(__file__).parent.parent / 'creds.json'
+                    if creds_file_path.exists():
+                        with open(creds_file_path, 'r') as f:
+                            creds_data = json.load(f)
+                        access_token = creds_data.get('access_token')
+                        if access_token:
+                            return {
+                                'success': True,
+                                'access_token': access_token,
+                                'token_type': creds_data.get('token_type', 'bearer'),
+                                'expires_in': creds_data.get('expires_in', 3600),
+                                'expires_at': creds_data.get('expires_at', '')
+                            }
+                except Exception as e:
+                    logger.warning(f"Failed to read token from another thread: {e}")
+            
+            # Proceed with actual token refresh
+            try:
+                # Read credentials from file
+                creds_file_path = Path(__file__).parent.parent / 'creds.json'
+                
+                if not creds_file_path.exists():
+                    logger.error("No credentials file found for token refresh")
+                    return {
+                        'success': False,
+                        'error': 'No saved credentials found'
+                    }
+                
+                with open(creds_file_path, 'r') as f:
+                    creds_data = json.load(f)
+                
+                # Validate required fields for refresh
+                required_fields = ['app_id', 'refresh_token', 'client_secret']
+                missing_fields = [field for field in required_fields if not creds_data.get(field)]
+                
+                if missing_fields:
+                    logger.error(f"Missing credentials for token refresh: {missing_fields}")
+                    return {
+                        'success': False,
+                        'error': 'Incomplete stored credentials'
+                    }
+                
+                # Prepare Amazon LWA token refresh request
+                token_url = 'https://api.amazon.com/auth/o2/token'
+                token_data = {
+                    'grant_type': 'refresh_token',
+                    'refresh_token': creds_data['refresh_token'],
+                    'client_id': creds_data['app_id'],
+                    'client_secret': creds_data['client_secret']
+                }
+                
+                refresh_headers = {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'User-Agent': 'AmazonConnector/1.0'
+                }
+                
+                logger.info("🔄 Refreshing access token during fetch operation...")
+                
+                # Make request to Amazon (don't use rate limited request to avoid recursion)
+                response = requests.post(
+                    token_url,
+                    data=token_data,
+                    headers=refresh_headers,
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    token_info = response.json()
+                    
+                    # Calculate expiry time
+                    expires_in = token_info.get('expires_in', 3600)
+                    expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+                    refreshed_at = datetime.utcnow()
+                    
+                    # Update credentials in file
+                    update_data = {
+                        'access_token': token_info.get('access_token'),
+                        'expires_at': expires_at.isoformat() + 'Z',
+                        'expires_in': expires_in,
+                        'token_type': token_info.get('token_type', 'bearer'),
+                        'last_refreshed': refreshed_at.isoformat() + 'Z'
+                    }
+                    
+                    # Read, update, and write back
+                    creds_data.update(update_data)
+                    with open(creds_file_path, 'w') as f:
+                        json.dump(creds_data, f, indent=2)
+                    
+                    # Update the last refresh time
+                    self.last_token_refresh_time = time.time()
+                    
+                    logger.info("✅ Access token refreshed successfully during fetch")
+                    
+                    return {
+                        'success': True,
+                        'access_token': token_info.get('access_token'),
+                        'token_type': token_info.get('token_type', 'bearer'),
+                        'expires_in': expires_in,
+                        'expires_at': expires_at.isoformat() + 'Z'
+                    }
+                else:
+                    try:
+                        error_info = response.json()
+                        error_msg = error_info.get('error_description', 'Token refresh failed')
+                    except:
+                        error_msg = f'HTTP {response.status_code}: Token refresh failed'
+                    
+                    logger.error(f"Token refresh failed: {error_msg}")
+                    return {
+                        'success': False,
+                        'error': f'Token refresh failed: {error_msg}'
+                    }
+                    
+            except Exception as e:
+                logger.error(f"Error during token refresh: {e}")
+                return {
+                    'success': False,
+                    'error': f'Token refresh error: {str(e)}'
+                }
+    
+    def _update_batch_size_on_success(self, batch_failures: List[Dict], batch_size: int):
+        """Update batch size based on successful batch processing."""
+        failure_rate = len(batch_failures) / batch_size if batch_size > 0 else 0
+        
+        if failure_rate < 0.1:  # Less than 10% failure rate
+            self.consecutive_batch_successes += 1
+            self.consecutive_batch_failures = 0
+            
+            # Increase batch size gradually after multiple successes
+            if self.consecutive_batch_successes >= 3 and self.current_batch_size < self.MAX_BATCH_SIZE:
+                old_size = self.current_batch_size
+                self.current_batch_size = min(self.current_batch_size + 1, self.MAX_BATCH_SIZE)
+                logger.info(f"📈 Increased batch size: {old_size} → {self.current_batch_size}")
+                self.consecutive_batch_successes = 0
+        else:
+            self.consecutive_batch_successes = 0
+    
+    def _update_batch_size_on_failure(self):
+        """Update batch size based on batch failure."""
+        self.consecutive_batch_failures += 1
+        self.consecutive_batch_successes = 0
+        
+        # Decrease batch size after failures
+        if self.consecutive_batch_failures >= 2 and self.current_batch_size > self.MIN_BATCH_SIZE:
+            old_size = self.current_batch_size
+            self.current_batch_size = max(self.current_batch_size - 1, self.MIN_BATCH_SIZE)
+            logger.warning(f"📉 Decreased batch size due to failures: {old_size} → {self.current_batch_size}")
+    
+    def _calculate_batch_delay(self, consecutive_failures: int) -> int:
+        """Calculate delay between batches based on failure history."""
+        base_delay = 15  # Base 15 second delay
+        
+        # Add progressive delay for consecutive failures
+        failure_penalty = min(consecutive_failures * 10, 60)  # Cap at 60 seconds
+        
+        return base_delay + failure_penalty
+    
+    def _calculate_estimated_time(self, total_orders: int) -> str:
+        """Calculate estimated processing time for given number of orders."""
+        # Account for rate limiting and batch delays
+        orders_per_minute = 60 / (1 / self.ORDER_ITEMS_MAX_REQUESTS_PER_SECOND)  # 30 orders per minute
+        num_batches = math.ceil(total_orders / self.current_batch_size)
+        batch_delays = (num_batches - 1) * 15  # 15 seconds between batches
+        
+        estimated_minutes = (total_orders / orders_per_minute) + (batch_delays / 60)
+        
+        if estimated_minutes < 1:
+            return f"{estimated_minutes * 60:.0f} seconds"
+        elif estimated_minutes < 60:
+            return f"{estimated_minutes:.1f} minutes"
+        else:
+            hours = estimated_minutes / 60
+            return f"{hours:.1f} hours"
     
     def fetch_single_order_items(self, headers: Dict[str, str], base_url: str, order: Dict) -> Dict:
         """
@@ -1728,110 +2636,6 @@ class FetchAmazonDataView(View):
                 'success': False,
                 'error': str(e)
             }
-    
-    def make_rate_limited_request(
-        self, 
-        method: str, 
-        url: str, 
-        headers: Dict[str, str], 
-        params: Optional[Dict] = None, 
-        data: Optional[Dict] = None,
-        is_order_items: bool = False
-    ) -> requests.Response:
-        """
-        Make HTTP request with rate limiting and retry logic.
-        
-        This method ensures we don't exceed Amazon's rate limits by:
-        1. Using the token bucket rate limiter
-        2. Handling rate limit responses (429)
-        3. Handling quota exceeded errors (403)
-        4. Implementing retry logic with exponential backoff
-        
-        Args:
-            method (str): HTTP method (GET, POST, etc.)
-            url (str): Request URL
-            headers (Dict[str, str]): Request headers
-            params (Optional[Dict]): URL parameters
-            data (Optional[Dict]): Request body data
-            is_order_items (bool): Whether this is an order items request
-            
-        Returns:
-            requests.Response: The API response
-            
-        Raises:
-            requests.exceptions.RequestException: If all retries fail
-        """
-        max_retries = 3
-        retry_delay = 1
-        
-        for attempt in range(max_retries):
-            try:
-                # Apply rate limiting based on endpoint type
-                if is_order_items:
-                    self.order_items_rate_limiter.acquire()
-                else:
-                    self.orders_rate_limiter.acquire()
-                
-                response = self.session.request(
-                    method=method,
-                    url=url,
-                    headers=headers,
-                    params=params,
-                    json=data,
-                    timeout=self.REQUEST_TIMEOUT
-                )
-                
-                # Handle rate limiting
-                if response.status_code == 429:
-                    retry_after = int(response.headers.get('Retry-After', retry_delay))
-                    # Add extra buffer time to be more conservative
-                    retry_after = retry_after + 2  # Add 2 extra seconds
-                    endpoint_type = "order items" if is_order_items else "orders"
-                    logger.warning(f"Rate limited on {endpoint_type} endpoint. Waiting {retry_after}s before retry (attempt {attempt + 1}/{max_retries})")
-                    time.sleep(retry_after)
-                    retry_delay = min(retry_delay * 2, 300)  # Cap at 5 minutes
-                    continue
-                
-                # Handle quota exceeded errors with better logging
-                if response.status_code == 403:
-                    try:
-                        error_data = response.json()
-                        if 'errors' in error_data:
-                            error = error_data['errors'][0]
-                            if error.get('code') == 'QuotaExceeded':
-                                retry_after = int(response.headers.get('Retry-After', 60))
-                                endpoint_type = "order items" if is_order_items else "orders"
-                                logger.warning(f"Quota exceeded on {endpoint_type} endpoint. Waiting {retry_after}s before retry (attempt {attempt + 1}/{max_retries})")
-                                time.sleep(retry_after)
-                                retry_delay = min(retry_delay * 2, 300)  # Cap at 5 minutes
-                                continue
-                            elif error.get('code') in ['Unauthorized', 'InvalidAccessToken']:
-                                logger.error(f"Authentication failed: {error.get('message', 'Invalid access token')}")
-                                # Don't retry authentication errors
-                                break
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        pass
-                
-                return response
-                
-            except requests.exceptions.Timeout:
-                if attempt < max_retries - 1:
-                    logger.warning(f"Request timeout, retrying in {retry_delay}s...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
-                    continue
-                raise
-            
-            except requests.exceptions.RequestException as e:
-                if attempt < max_retries - 1:
-                    logger.warning(f"Request failed, retrying in {retry_delay}s: {e}")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
-                    continue
-                raise
-        
-        # If we get here, all retries failed
-        raise requests.exceptions.RequestException("Max retries exceeded")
     
     def handle_api_error(self, response: requests.Response, operation: str) -> Dict[str, str]:
         """
@@ -1911,7 +2715,7 @@ class FetchAmazonDataView(View):
             order_id = order.get('AmazonOrderId')
             
             # Get items for this order
-            items = order_items.get(order_id, [])
+            items = order_items.get(order_id, []) if order_id else []
             
             # Use all raw order data without mapping
             structured_order = dict(order)  # Copy all fields from original order
@@ -2321,6 +3125,8 @@ class ActivitiesListView(View):
                     'detail': activity.detail,
                     'error_message': activity.error_message,
                     'database_saved': activity.database_saved,
+                    'mssql_saved': activity.mssql_saved,
+                    'azure_saved': activity.azure_saved,
                     'created_at': format_datetime(activity.created_at),
                     'updated_at': format_datetime(activity.updated_at),
                 }
@@ -2409,6 +3215,8 @@ class ActivityDetailView(View):
                 'detail': activity.detail,
                 'error_message': activity.error_message,
                 'database_saved': activity.database_saved,
+                'mssql_saved': activity.mssql_saved,
+                'azure_saved': activity.azure_saved,
                 'created_at': format_datetime(activity.created_at),
                 'updated_at': format_datetime(activity.updated_at),
             }
@@ -2576,3 +3384,271 @@ class ActivitiesStatsView(View):
                 'error': 'Failed to get activity statistics',
                 'details': str(e)
             }, status=500)
+
+@method_decorator(csrf_exempt, name='dispatch')
+class FetchMissingOrderItemsView(View):
+    """
+    Fetch order items for specific missing orders by their IDs.
+    
+    This endpoint is designed for recovering failed order items from the main fetch process.
+    It uses a conservative, single-order approach for maximum reliability.
+    """
+    
+    def post(self, request):
+        """
+        Fetch order items for specific missing orders.
+        
+        Expected request parameters:
+        - access_token: Amazon SP-API access token  
+        - marketplace_id: Amazon marketplace ID
+        - order_ids: List of Amazon Order IDs to fetch items for
+        
+        Returns:
+            JsonResponse: Contains the fetched items and statistics
+        """
+        try:
+            # Parse request data
+            try:
+                data = json.loads(request.body)
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in missing orders request: {e}")
+                return JsonResponse({
+                    'success': False,
+                    'error': 'Invalid JSON format',
+                    'details': str(e)
+                }, status=400)
+            
+            # Validate required parameters
+            required_fields = ['access_token', 'marketplace_id', 'order_ids']
+            missing_fields = [field for field in required_fields if not data.get(field)]
+            
+            if missing_fields:
+                return JsonResponse({
+                    'success': False,
+                    'error': 'Missing required parameters',
+                    'details': f'Required fields: {", ".join(missing_fields)}'
+                }, status=400)
+            
+            # Extract parameters
+            access_token = data['access_token'].strip()
+            marketplace_id = data['marketplace_id'].strip()
+            order_ids = data['order_ids']
+            
+            # Validate order_ids
+            if not isinstance(order_ids, list):
+                return JsonResponse({
+                    'success': False,
+                    'error': 'Invalid order_ids format',
+                    'details': 'order_ids must be a list of Amazon Order IDs'
+                }, status=400)
+            
+            if len(order_ids) == 0:
+                return JsonResponse({
+                    'success': False,
+                    'error': 'Empty order_ids list',
+                    'details': 'Please provide at least one order ID to fetch'
+                }, status=400)
+            
+            if len(order_ids) > 100:
+                return JsonResponse({
+                    'success': False,
+                    'error': 'Too many order IDs',
+                    'details': 'Maximum 100 order IDs allowed per request for optimal performance'
+                }, status=400)
+            
+            # Setup headers
+            headers = {
+                "x-amz-access-token": access_token,
+                "Content-Type": "application/json",
+                "x-amz-date": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                "User-Agent": "AmazonConnector/1.0"
+            }
+            
+            # Get base URL for marketplace
+            base_url = FetchAmazonDataView.SP_API_BASE_URLS.get(marketplace_id)
+            if not base_url:
+                return JsonResponse({
+                    'success': False,
+                    'error': 'Unsupported marketplace',
+                    'details': f'Marketplace {marketplace_id} is not supported'
+                }, status=400)
+            
+            # Create FetchAmazonDataView instance to use its methods
+            fetch_view = FetchAmazonDataView()
+            
+            # Fetch missing order items
+            logger.info(f"🎯 Fetching missing order items for {len(order_ids)} orders in marketplace {marketplace_id}")
+            
+            start_time = time.time()
+            result = fetch_view.fetch_missing_order_items(headers, base_url, order_ids)
+            duration = time.time() - start_time
+            
+            # Prepare response
+            response_data = {
+                'items': result['items'],
+                'failed_orders': result['failed_orders'],
+                'statistics': result['statistics'],
+                'metadata': {
+                    'marketplace_id': marketplace_id,
+                    'requested_order_ids': order_ids,
+                    'fetch_completed_at': datetime.utcnow().isoformat() + 'Z',
+                    'processing_time_seconds': round(duration, 2)
+                }
+            }
+            
+            logger.info(f"✅ Missing orders fetch completed in {duration:.2f}s: "
+                       f"{result['statistics']['successful_orders']}/{result['statistics']['total_requested']} "
+                       f"({result['statistics']['success_rate']:.1f}% success rate)")
+            
+            return JsonResponse({
+                'success': True,
+                'message': f"Fetched items for {result['statistics']['successful_orders']} orders",
+                'data': response_data
+            })
+            
+        except Exception as e:
+            logger.error(f"Unexpected error in FetchMissingOrderItemsView: {e}", exc_info=True)
+            return JsonResponse({
+                'success': False,
+                'error': 'Unexpected error occurred',
+                'details': 'An unexpected error occurred while fetching missing order items'
+            }, status=500)
+    
+    def get(self, request):
+        """Handle GET requests with helpful information."""
+        return JsonResponse({
+            'message': 'Fetch Missing Order Items API',
+            'methods': ['POST'],
+            'required_fields': ['access_token', 'marketplace_id', 'order_ids'],
+            'description': 'Fetch order items for specific missing orders by their IDs',
+            'order_ids_format': 'List of Amazon Order IDs (max 100 per request)',
+            'example_order_ids': ['111-1234567-1234567', '111-7654321-7654321']
+        })
+
+    def refresh_access_token_internal(self) -> Dict:
+        """
+        Internal method to refresh access token using stored credentials.
+        This is used when authentication fails during fetch operations.
+        
+        Returns:
+            Dict: Contains success status and new token data or error information
+        """
+        try:
+            # Read credentials from file
+            creds_file_path = Path(__file__).parent.parent / 'creds.json'
+            
+            if not creds_file_path.exists():
+                logger.error("No credentials file found for token refresh")
+                return {
+                    'success': False,
+                    'error': 'No saved credentials found',
+                    'details': 'Please reconnect your Amazon account'
+                }
+            
+            with open(creds_file_path, 'r') as f:
+                creds_data = json.load(f)
+            
+            # Validate required fields for refresh
+            required_fields = ['app_id', 'refresh_token', 'client_secret']
+            missing_fields = [field for field in required_fields if not creds_data.get(field)]
+            
+            if missing_fields:
+                logger.error(f"Missing credentials for token refresh: {missing_fields}")
+                return {
+                    'success': False,
+                    'error': 'Incomplete stored credentials',
+                    'details': 'Please reconnect your Amazon account'
+                }
+            
+            # Prepare Amazon LWA token refresh request
+            token_url = 'https://api.amazon.com/auth/o2/token'
+            token_data = {
+                'grant_type': 'refresh_token',
+                'refresh_token': creds_data['refresh_token'],
+                'client_id': creds_data['app_id'],
+                'client_secret': creds_data['client_secret']
+            }
+            
+            headers = {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': 'AmazonConnector/1.0'
+            }
+            
+            logger.info("🔄 Refreshing access token during fetch operation...")
+            
+            # Make request to Amazon
+            response = requests.post(
+                token_url,
+                data=token_data,
+                headers=headers,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                token_info = response.json()
+                
+                # Calculate expiry time
+                expires_in = token_info.get('expires_in', 3600)
+                expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+                refreshed_at = datetime.utcnow()
+                
+                # Update credentials in file
+                update_data = {
+                    'access_token': token_info.get('access_token'),
+                    'expires_at': expires_at.isoformat() + 'Z',
+                    'expires_in': expires_in,
+                    'token_type': token_info.get('token_type', 'bearer'),
+                    'last_refreshed': refreshed_at.isoformat() + 'Z'
+                }
+                
+                # Read, update, and write back
+                creds_data.update(update_data)
+                with open(creds_file_path, 'w') as f:
+                    json.dump(creds_data, f, indent=2)
+                
+                logger.info("✅ Access token refreshed successfully during fetch")
+                
+                return {
+                    'success': True,
+                    'access_token': token_info.get('access_token'),
+                    'token_type': token_info.get('token_type', 'bearer'),
+                    'expires_in': expires_in,
+                    'expires_at': expires_at.isoformat() + 'Z'
+                }
+            else:
+                try:
+                    error_info = response.json()
+                    error_msg = error_info.get('error_description', 'Token refresh failed')
+                except:
+                    error_msg = f'HTTP {response.status_code}: Token refresh failed'
+                
+                logger.error(f"Token refresh failed: {error_msg}")
+                return {
+                    'success': False,
+                    'error': 'Token refresh failed',
+                    'details': error_msg
+                }
+                
+        except Exception as e:
+            logger.error(f"Error during token refresh: {e}")
+            return {
+                'success': False,
+                'error': 'Token refresh error',
+                'details': str(e)
+            }
+    
+    def update_request_headers_with_new_token(self, headers: Dict[str, str], new_access_token: str) -> Dict[str, str]:
+        """
+        Update request headers with a new access token.
+        
+        Args:
+            headers (Dict[str, str]): Original headers
+            new_access_token (str): New access token
+            
+        Returns:
+            Dict[str, str]: Updated headers
+        """
+        updated_headers = headers.copy()
+        updated_headers["x-amz-access-token"] = new_access_token
+        updated_headers["x-amz-date"] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        return updated_headers
