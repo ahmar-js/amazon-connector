@@ -64,7 +64,7 @@ def fetch_amazon_data(self):
             logger.info(f"payload: {payload}")
 
             # Call your Django API
-            response = requests.post("http://127.0.0.1:8000/api/fetch-data/", json=payload)
+            response = requests.post("http://127.0.0.1:8000/api/fetch-data/", json=payload, timeout=60)
 
             logger.info(f"API Response ({response.status_code})")
             # timestamp = timezone.now().strftime('%Y%m%d_%H%M%S')
