@@ -1168,7 +1168,7 @@ class FetchAmazonDataView(View):
                 # Try to get existing in-progress activity first, then create if needed
                 activity, created = Activities.objects.get_or_create(
                     marketplace_id=marketplace_id,
-                    activity_type='fetch',
+                    activity_type='orders',
                     date_from=start_dt.date(),
                     date_to=end_dt.date(),
                     status='in_progress',

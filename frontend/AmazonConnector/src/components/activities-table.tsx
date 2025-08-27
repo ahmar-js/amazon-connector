@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react"
+import { useState, useEffect, useMemo, type JSX } from "react"
 import { format } from "date-fns"
 import {
   createColumnHelper,
@@ -15,7 +15,6 @@ import type {
   VisibilityState,
 } from "@tanstack/react-table"
 import { Button } from "@/components/ui/button"
-import { Label } from "@/components/ui/label"
 import {
   Table,
   TableBody,
@@ -59,8 +58,7 @@ import {
   Activity as ActivityIcon,
   Database,
   FileText,
-  BarChart3,
-  ExternalLink
+  BarChart3
 } from "lucide-react"
 import {
   AmazonConnectorService,
@@ -209,13 +207,7 @@ export function ActivitiesTable({ className, refreshTrigger }: ActivitiesTablePr
     setLoadingDetails(false)
   }
   
-  const copyToClipboard = async (text: string) => {
-    try {
-      await navigator.clipboard.writeText(text)
-    } catch (err) {
-      console.error('Failed to copy text: ', err)
-    }
-  }
+  
 
   const handleFilterChange = () => {
     setCurrentPage(1)
@@ -232,11 +224,11 @@ export function ActivitiesTable({ className, refreshTrigger }: ActivitiesTablePr
             <Button
               variant="ghost"
               onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-              className="h-8 p-0 hover:bg-transparent"
+              className="h-8 p-0 hover:bg-transparent w-full justify-center"
             >
-              <Calendar className="mr-2 h-4 w-4" />
+              <Calendar className="h-4 w-4" />
               Date
-              <ArrowUpDown className="ml-2 h-4 w-4" />
+              <ArrowUpDown className="h-4 w-4" />
             </Button>
           )
         },
@@ -266,7 +258,7 @@ export function ActivitiesTable({ className, refreshTrigger }: ActivitiesTablePr
             }
             
             return (
-              <div className="flex flex-col">
+              <div className="flex flex-col items-center">
                 <span className="font-medium">
                   {format(date, "MMM dd, yyyy")}
                 </span>
@@ -292,34 +284,39 @@ export function ActivitiesTable({ className, refreshTrigger }: ActivitiesTablePr
             <Button
               variant="ghost"
               onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-              className="h-8 p-0 hover:bg-transparent"
+              className="h-8 p-0 hover:bg-transparent w-full justify-center"
             >
-              <Database className="mr-2 h-4 w-4" />
-              Marketplace
-              <ArrowUpDown className="ml-2 h-4 w-4" />
+              <Database className="h-4 w-4 shrink-0" />
+              <span className="">Marketplace</span>
+              <ArrowUpDown className="h-4 w-4 shrink-0" />
             </Button>
           )
         },
-        size: 120,
+        size: 70,
+        minSize: 60,
+        maxSize: 90,
         cell: ({ row }) => {
           return (
-            <Badge variant="outline" className="font-mono text-xs">
-              {row.getValue("marketplace_name")}
-            </Badge>
+            <div className="flex flex-col items-center">
+              <Badge variant="outline" className="font-mono text-xs max-w-[80px] overflow-hidden text-ellipsis whitespace-nowrap">
+                {row.getValue("marketplace_name")}
+              </Badge>
+            </div>
           )
         },
       }),
+
       columnHelper.accessor("status", {
         header: ({ column }) => {
           return (
             <Button
               variant="ghost"
               onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-              className="h-8 p-0 hover:bg-transparent"
+              className="h-8 p-0 hover:bg-transparent w-full justify-center"
             >
-              <ActivityIcon className="mr-2 h-4 w-4" />
+              <ActivityIcon className="h-4 w-4" />
               Status
-              <ArrowUpDown className="ml-2 h-4 w-4" />
+              <ArrowUpDown className="h-4 w-4" />
             </Button>
           )
         },
@@ -329,16 +326,50 @@ export function ActivitiesTable({ className, refreshTrigger }: ActivitiesTablePr
           const statusDisplay = row.original.status_display
           
           return (
-            <Badge className={getStatusColor(status)}>
-              {getStatusIcon(status)}
-              <span className="ml-1">{statusDisplay}</span>
-            </Badge>
+            <div className="flex flex-col items-center">
+              <Badge className={getStatusColor(status)}>
+                {getStatusIcon(status)}
+                <span className="ml-1">{statusDisplay}</span>
+              </Badge>
+            </div>
+          )
+        },
+      }),
+            columnHelper.accessor("activity_type", {
+        header: ({ column }) => {
+          return (
+            <Button
+              variant="ghost"
+              onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
+              className="h-8 p-0 hover:bg-transparent w-full justify-center"
+            >
+              <ActivityIcon className="h-4 w-4 shrink-0" />
+              <span className="">Type</span>
+              <ArrowUpDown className="h-4 w-4 shrink-0" />
+            </Button>
+          )
+        },
+        size: 90,
+        minSize: 80,
+        maxSize: 110,
+        cell: ({ row }) => {
+          return (
+            <div className="flex flex-col items-center">
+              <Badge variant="outline" className="font-mono text-xs max-w-[80px] overflow-hidden text-ellipsis whitespace-nowrap">
+                {row.getValue("activity_type")}
+              </Badge>
+            </div>
           )
         },
       }),
       columnHelper.display({
         id: "date_range",
-        header: "Date Range",
+        header: () => (
+          <div className="flex items-center justify-center w-full">
+            <Calendar className="mr-2 h-4 w-4 shrink-0" />
+            <span>Date Range</span>
+          </div>
+        ),
         size: 120,
         cell: ({ row }) => {
           const dateFromValue = row.original.date_from as string
@@ -367,7 +398,7 @@ export function ActivitiesTable({ className, refreshTrigger }: ActivitiesTablePr
             }
             
             return (
-              <div className="flex flex-col text-sm">
+              <div className="flex flex-col text-sm items-center">
                 <span>{format(dateFrom, "MMM dd")} - {format(dateTo, "MMM dd")}</span>
                 <span className="text-xs text-muted-foreground">
                   {Math.ceil((dateTo.getTime() - dateFrom.getTime()) / (1000 * 60 * 60 * 24))} days
@@ -389,11 +420,11 @@ export function ActivitiesTable({ className, refreshTrigger }: ActivitiesTablePr
             <Button
               variant="ghost"
               onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-              className="h-8 p-0 hover:bg-transparent"
+              className="h-8 p-0 hover:bg-transparent w-full justify-center"
             >
-              <FileText className="mr-2 h-4 w-4" />
+              <FileText className="h-4 w-4" />
               Records
-              <ArrowUpDown className="ml-2 h-4 w-4" />
+              <ArrowUpDown className="h-4 w-4" />
             </Button>
           )
         },
@@ -404,7 +435,7 @@ export function ActivitiesTable({ className, refreshTrigger }: ActivitiesTablePr
           const total = row.getValue("total_records") as number
           
           return (
-            <div className="flex flex-col text-sm">
+            <div className="flex flex-col text-sm items-center">
               <span className="font-medium">{total.toLocaleString()}</span>
               <span className="text-xs text-muted-foreground">
                 {orders.toLocaleString()} orders, {items.toLocaleString()} items
@@ -419,40 +450,42 @@ export function ActivitiesTable({ className, refreshTrigger }: ActivitiesTablePr
             <Button
               variant="ghost"
               onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-              className="h-8 p-0 hover:bg-transparent"
+              className="h-8 p-0 hover:bg-transparent w-full justify-center"
             >
-              <Clock className="mr-2 h-4 w-4" />
+              <Clock className="h-4 w-4" />
               Duration
-              <ArrowUpDown className="ml-2 h-4 w-4" />
+              <ArrowUpDown className="h-4 w-4" />
             </Button>
           )
         },
-        size: 90,
+        size: 50,
         cell: ({ row }) => {
           const duration = row.getValue("duration_formatted") as string
           return (
-            <Badge variant="secondary" className="font-mono">
-              {duration}
-            </Badge>
-          )
-        },
-      }),
-      columnHelper.accessor("detail", {
-        header: "Details",
-        size: 300,
-        cell: ({ row }) => {
-          const detail = row.getValue("detail") as string
-          const truncated = detail.length > 40 ? detail.substring(0, 40) + "..." : detail
-          
-          return (
-            <div className="max-w-[300px] min-w-[200px]">
-              <span className="text-sm text-wrap break-words" title={detail}>
-                {truncated}
-              </span>
+            <div className="flex flex-col items-center">
+              <Badge variant="secondary" className="font-mono">
+                {duration}
+              </Badge>
             </div>
           )
         },
       }),
+      // columnHelper.accessor("detail", {
+      //   header: "Details",
+      //   size: 100,
+      //   cell: ({ row }) => {
+      //     const detail = row.getValue("detail") as string
+      //     const truncated = detail.length > 20 ? detail.substring(0, 20) + "..." : detail
+          
+      //     return (
+      //       <div className="max-w-[300px] min-w-[100px]">
+      //         <span className="text-sm text-wrap break-words" title={detail}>
+      //           {truncated}
+      //         </span>
+      //       </div>
+      //     )
+      //   },
+      // }),
       columnHelper.accessor("database_saved", {
         header: ({ column }) => {
           return (
@@ -461,15 +494,15 @@ export function ActivitiesTable({ className, refreshTrigger }: ActivitiesTablePr
               onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
               className="h-8 p-0 hover:bg-transparent"
             >
-              <Database className="mr-2 h-4 w-4" />
+              <Database className=" h-4 w-4" />
               DB Saved
-              <ArrowUpDown className="ml-2 h-4 w-4" />
+              <ArrowUpDown className=" h-4 w-4" />
             </Button>
           )
         },
-        size: 100,
-        minSize: 80,
-        maxSize: 120,
+        size: 80,
+        minSize: 60,
+        maxSize: 100,
         cell: ({ row }) => {
           const activity = row.original
           const status = activity.status

@@ -119,7 +119,6 @@ db.sqlite3
 
 
 
-*.md
 main.py
 creds.py
 creds.json
@@ -127,3 +126,4 @@ creds.json
 last_run.json
 *.csv
 inventory.py
+processed_data/

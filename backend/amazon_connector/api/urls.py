@@ -15,6 +15,12 @@ from .views import (
     ActivitiesStatsView,
     # TestFetchOrderItemsView
 )
+from .inventory_views import (
+    FetchInventoryReportView,
+    CreateReportScheduleView,
+    GetReportSchedulesView,
+    CancelReportScheduleView,
+)
 
 # Create router for ViewSets
 router = DefaultRouter()
@@ -31,6 +37,12 @@ urlpatterns = [
     # path('test-fetch-order-items/', TestFetchOrderItemsView.as_view(), name='test_fetch_order_items'),
     path('download-processed/', DownloadProcessedDataView.as_view(), name='download_processed_data'),
     path('processed-status/', ProcessedDataStatusView.as_view(), name='processed_data_status'),
+
+    # Inventory report endpoints
+    path('inventory/reports/', FetchInventoryReportView.as_view(), name='fetch_inventory_reports'),
+    path('inventory/report-schedules/', CreateReportScheduleView.as_view(), name='create_report_schedule'),
+    path('inventory/report-schedules/list/', GetReportSchedulesView.as_view(), name='get_report_schedules'),
+    path('inventory/report-schedules/<str:report_schedule_id>/', CancelReportScheduleView.as_view(), name='cancel_report_schedule'),
     
     # Activity management endpoints
     path('activities/', ActivitiesListView.as_view(), name='activities_list'),

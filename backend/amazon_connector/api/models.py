@@ -6,14 +6,14 @@ import uuid
 # Create your models here.
 class Activities(models.Model):
     ACTIVITY_TYPE_CHOICES = [
-        ('fetch', 'Data Fetch'),
+        ('orders', 'Data Fetch'),
+        ('reports', 'Reports Fetch'),
         # ('export', 'Data Export'),
         ('sync', 'Data Sync'),
     ]
     
     ACTION_CHOICES = [
         ('manual', 'Manual'),
-        # ('scheduled', 'Scheduled'),
         ('automatic', 'Automatic'),
     ]
     
@@ -43,7 +43,7 @@ class Activities(models.Model):
     activity_type = models.CharField(
         max_length=50,
         choices=ACTIVITY_TYPE_CHOICES,
-        default='fetch',
+        default='fetch orders',
         help_text="Type of activity performed"
     )
     

@@ -89,6 +89,25 @@ def fetch_amazon_data(self):
         logger.error(f"Task failed: {exc}")
         raise self.retry(exc=exc, countdown=60, max_retries=3)
 
+@shared_task(bind=True, queue='reports')
+def generate_reports(self):
+    """
+    Asynchronous task to generate reports
+    """
+    try:
+        print("Generating reports...")
+        marketplaces = ['IT']
+        payload = {
+            "marketplaces": marketplaces,
+        }
+        response = requests.post("http://127.0.0.1:8000/api/inventory/reports/", json=payload)
+        logger.info(f"API Response ({response.status_code})")
+
+        
+    except Exception as exc:
+        logger.error(f"Report generation task failed: {exc}")
+        raise self.retry(exc=exc, countdown=60, max_retries=3)
+
 @shared_task(bind=True, queue='syncing')
 def sync_amazon_data(self, data, **kwargs):
     """
