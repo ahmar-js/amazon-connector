@@ -281,7 +281,7 @@ class AmazonDataProcessor:
                     for value in df[field]:
                         if pd.isna(value) or value == '' or value is None:
                             amount_values.append(0.0)
-                            currency_values.append('USD')
+                            currency_values.append('')
                         else:
                             # Convert to string and split
                             value_str = str(value).strip()
@@ -314,7 +314,7 @@ class AmazonDataProcessor:
                                     currency_values.append(currency_match.group() if currency_match else '')
                                 else:
                                     amount_values.append(0.0)
-                                    currency_values.append('USD')
+                                    currency_values.append('')
                     
                     # Add the new columns
                     df[amount_col] = amount_values
