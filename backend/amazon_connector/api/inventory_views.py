@@ -348,6 +348,7 @@ class FetchInventoryReportView(View):
                     'details': str(e)
                 }, status=500)
             
+            # --------------------------Need to remove this functionality--------------------------
             # Get date range (previous day)
             today = datetime.now(timezone.utc).date()
             yesterday = today - timedelta(days=1)
@@ -355,7 +356,7 @@ class FetchInventoryReportView(View):
             # Date range for filtering reports (previous day)
             created_after = yesterday.strftime('%Y-%m-%dT00:00:00Z')
             created_before = yesterday.strftime('%Y-%m-%dT23:59:59Z')
-            
+            #-----------------------------------------------------------------------------------
             results = {}
             total_reports_found = 0
             total_items_processed = 0
