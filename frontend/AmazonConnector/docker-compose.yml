@@ -1,0 +1,12 @@
+services:
+  web:
+    build:
+      context: .
+      args:
+        # Propagate API base URL to Vite build if needed
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000/api}
+    image: amazon-connector-frontend
+    container_name: amazon_connector_frontend
+    ports:
+      - "5173:80"
+    restart: unless-stopped
