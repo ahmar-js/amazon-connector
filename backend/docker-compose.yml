@@ -14,6 +14,7 @@ services:
       # Django settings
       - DEBUG=${DEBUG}                     # Should be False in production
       - SECRET_KEY=${SECRET_KEY}
+      - CORS_ALLOWED_ORIGINS=http://localhost:5173
 
       # MSSQL (local / on-prem)
       - MSSQL_SERVER=${MSSQL_SERVER}
