@@ -1,0 +1,45 @@
+# Byte-compiled / caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+env/
+.venv/
+venv/
+
+# Django
+*.sqlite3
+db.sqlite3
+/media
+/staticfiles
+/static
+
+# Local config & secrets
+.env
+creds.json
+last_run.json
+processed_data/
+processed_data/*
+*.cursor
+main.py
+creds.py
+inventory.py
+*.csv
+
+# Git
+.git
+.gitignore
+
+# Docker / build
+docker-compose.override.yml
+Dockerfile*
+*.log
+node_modules/
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store

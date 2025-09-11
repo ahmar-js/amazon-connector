@@ -1,0 +1,146 @@
+services:
+  # Django + Gunicorn Web App
+  web:
+    build: .
+    container_name: amazon_connector_django_app
+    working_dir: /app/amazon_connector
+    command: gunicorn amazon_connector.wsgi:application --bind 0.0.0.0:8000
+    entrypoint: ["entrypoint.sh"]
+    # In production, we don't mount local code to container (use COPY in Dockerfile instead)
+    # For development, you can uncomment the volume below
+    # volumes:
+    #   - .:/app
+    environment:
+      # Django settings
+      - DEBUG=${DEBUG}                     # Should be False in production
+      - SECRET_KEY=${SECRET_KEY}
+
+      # MSSQL (local / on-prem)
+      - MSSQL_SERVER=${MSSQL_SERVER}
+      - MSSQL_DATABASE=${MSSQL_DATABASE}
+      - MSSQL_USER=${MSSQL_USER}
+      - MSSQL_PASSWORD=${MSSQL_PASSWORD}
+
+      # Azure SQL
+      - AZURE_SERVER=${AZURE_SERVER}
+      - AZURE_DATABASE=${AZURE_DATABASE}
+      - AZURE_USER=${AZURE_USER}
+      - AZURE_PASSWORD=${AZURE_PASSWORD}
+
+      # Redis broker URL for Celery
+      - REDIS_URL=redis://redis:6379/0
+      - WAIT_FOR=redis:6379
+
+    ports:
+      - "8000:8000"   # Expose Django app on port 8000 (adjust if behind Nginx)
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always   # Auto-restart if it crashes
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/healthz/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Redis broker for Celery
+  redis:
+    image: redis:7
+    container_name: redis_broker
+    restart: always
+    # Comment out ports in production (don’t expose Redis to outside world)
+    # ports:
+    #   - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Celery worker for "fetching" queue
+  celery_fetching:
+    build: .
+    container_name: celery_fetching_worker
+    working_dir: /app/amazon_connector
+    command: celery -A amazon_connector worker -l info -Q fetching
+    entrypoint: ["entrypoint.sh"]
+    # volumes:
+    #   - .:/app    # Uncomment for development hot reload
+    environment:
+      - DEBUG=${DEBUG}
+      - SECRET_KEY=${SECRET_KEY}
+      - MSSQL_SERVER=${MSSQL_SERVER}
+      - MSSQL_DATABASE=${MSSQL_DATABASE}
+      - MSSQL_USER=${MSSQL_USER}
+      - MSSQL_PASSWORD=${MSSQL_PASSWORD}
+      - AZURE_SERVER=${AZURE_SERVER}
+      - AZURE_DATABASE=${AZURE_DATABASE}
+      - AZURE_USER=${AZURE_USER}
+      - AZURE_PASSWORD=${AZURE_PASSWORD}
+      - REDIS_URL=redis://redis:6379/0
+      - WAIT_FOR=redis:6379
+    depends_on:
+      web:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: always
+
+  # Celery worker for "reports" queue
+  celery_reports:
+    build: .
+    container_name: celery_reports_worker
+    working_dir: /app/amazon_connector
+    command: celery -A amazon_connector worker -l info -Q reports
+    entrypoint: ["entrypoint.sh"]
+    # volumes:
+    #   - .:/app    # Uncomment for development hot reload
+    environment:
+      - DEBUG=${DEBUG}
+      - SECRET_KEY=${SECRET_KEY}
+      - MSSQL_SERVER=${MSSQL_SERVER}
+      - MSSQL_DATABASE=${MSSQL_DATABASE}
+      - MSSQL_USER=${MSSQL_USER}
+      - MSSQL_PASSWORD=${MSSQL_PASSWORD}
+      - AZURE_SERVER=${AZURE_SERVER}
+      - AZURE_DATABASE=${AZURE_DATABASE}
+      - AZURE_USER=${AZURE_USER}
+      - AZURE_PASSWORD=${AZURE_PASSWORD}
+      - REDIS_URL=redis://redis:6379/0
+      - WAIT_FOR=redis:6379
+    depends_on:
+      web:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: always
+
+  # Celery Beat for scheduled tasks
+  celery_beat:
+    build: .
+    container_name: celery_beat
+    working_dir: /app/amazon_connector
+    command: celery -A amazon_connector beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    entrypoint: ["entrypoint.sh"]
+    # volumes:
+    #   - .:/app    # Uncomment for development hot reload
+    environment:
+      - DEBUG=${DEBUG}
+      - SECRET_KEY=${SECRET_KEY}
+      - MSSQL_SERVER=${MSSQL_SERVER}
+      - MSSQL_DATABASE=${MSSQL_DATABASE}
+      - MSSQL_USER=${MSSQL_USER}
+      - MSSQL_PASSWORD=${MSSQL_PASSWORD}
+      - AZURE_SERVER=${AZURE_SERVER}
+      - AZURE_DATABASE=${AZURE_DATABASE}
+      - AZURE_USER=${AZURE_USER}
+      - AZURE_PASSWORD=${AZURE_PASSWORD}
+      - REDIS_URL=redis://redis:6379/0
+      - WAIT_FOR=redis:6379
+    depends_on:
+      web:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: always
