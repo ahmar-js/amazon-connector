@@ -68,6 +68,7 @@ import {
   ApiError
 } from "@/lib/api"
 import { ActivityDetailsModal } from "./activity-details-modal"
+import MARKETPLACES from '@/lib/marketplaces'
 
 // Status color mapping
 const getStatusColor = (status: string) => {
@@ -105,16 +106,8 @@ const getStatusIcon = (status: string) => {
   }
 }
 
-// Marketplace options for filtering
-const MARKETPLACE_OPTIONS = [
-  { value: "ATVPDKIKX0DER", label: "United States" },
-  { value: "A2EUQ1WTGCTBG2", label: "Canada" },
-  { value: "A1F83G8C2ARO7P", label: "United Kingdom" },
-  { value: "A1PA6795UKMFR9", label: "Germany" },
-  { value: "A13V1IB3VIYZZH", label: "France" },
-  { value: "APJ6JRA9NG5V4", label: "Italy" },
-  { value: "A1RKKUPIHCS9HS", label: "Spain" },
-]
+// Marketplace options for filtering (derived from centralized mapping)
+const MARKETPLACE_OPTIONS = Object.values(MARKETPLACES).map(m => ({ value: m.id, label: m.name || m.code, disabled: m.disabled }))
 
 interface ActivitiesTableProps {
   className?: string

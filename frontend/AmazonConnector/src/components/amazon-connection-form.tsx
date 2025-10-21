@@ -10,7 +10,7 @@ import { Form, FormControl, FormDescription, FormField, FormItem, FormLabel, For
 import { Badge } from "@/components/ui/badge"
 import { Info, ExternalLink, Key, Shield, RefreshCw, CheckCircle, AlertCircle, ArrowLeft, LogOut, TestTube, Database } from "lucide-react"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { ManageDataDialog, AMAZON_MARKETPLACES } from "./manage-data-dialog"
+import { ManageDataDialog } from "./manage-data-dialog"
 import { AmazonConnectorService, ApiError, type AmazonConnectionRequest } from "@/lib/api"
 
 // Form validation schema

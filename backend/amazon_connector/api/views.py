@@ -877,14 +877,14 @@ class FetchAmazonDataView(View):
     ORDERS_BURST_LIMIT = 20
     ORDER_ITEMS_BURST_LIMIT = 30
 
-    # Adaptive batch processing parameters (made more conservative)
-    INITIAL_BATCH_SIZE = 2  # Start with smaller batches (reduced from 5)
+    # Adaptive batch processing parameters (tuned for v0 limits)
+    INITIAL_BATCH_SIZE = 10  # Start higher to utilize burst
     MIN_BATCH_SIZE = 1
-    MAX_BATCH_SIZE = 5  # Reduced maximum (was 10)
+    MAX_BATCH_SIZE = 30  # Align with order items burst
     
-    # Circuit breaker parameters (more sensitive)
-    CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5  # Lower threshold (was 10)
-    CIRCUIT_BREAKER_RECOVERY_TIMEOUT = 600  # Longer recovery (10 minutes, was 5)
+    # Circuit breaker parameters (slightly relaxed)
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD = 10
+    CIRCUIT_BREAKER_RECOVERY_TIMEOUT = 300  # 5 minutes
     
     # Enhanced retry parameters (more conservative)
     MAX_RETRIES = 3  # Reduced from 5 to prevent excessive retries
@@ -892,8 +892,8 @@ class FetchAmazonDataView(View):
     MAX_RETRY_DELAY = 600  # Increased max delay (10 minutes, was 5)
     JITTER_RANGE = 0.2  # Increased jitter (±20%, was ±10%)
 
-    # Timeout for API requests in seconds (more generous)
-    REQUEST_TIMEOUT = 120  # Increased from 90 seconds
+    # Timeout for API requests in seconds (fail faster; outer retries handle backoff)
+    REQUEST_TIMEOUT = 60
     
     class EnhancedTokenBucketRateLimiter:
         """
@@ -1125,10 +1125,15 @@ class FetchAmazonDataView(View):
                 # start_dt = datetime.fromisoformat(start_date.replace('Z', ''))
                 # end_dt = datetime.fromisoformat(end_date.replace('Z', ''))
                 # logger.info(f"🔍 Start date: {start_dt}, End date: {end_dt}")
-                if marketplace_id == "A1F83G8C2ARO7P":
-                    start_dt_str, end_dt_str = self.convert_dates(start_date, end_date, "UK")
+                # Convert input dates from marketplace local time to UTC
+                # UK -> Europe/London (BST/GMT); US/CA -> America/Los_Angeles (PST/PDT); Others -> Europe/Paris (MET/CET)
+                if marketplace_id == "A1F83G8C2ARO7P":  # UK
+                    tz_market = "UK"
+                elif marketplace_id in ("ATVPDKIKX0DER", "A2EUQ1WTGCTBG2"):  # US or CA
+                    tz_market = "US"  # treat US/CA as Pacific Time
                 else:
-                    start_dt_str, end_dt_str = self.convert_dates(start_date, end_date, "IT")
+                    tz_market = "IT"  # any EU marketplace; handled as Europe/Paris
+                start_dt_str, end_dt_str = self.convert_dates(start_date, end_date, tz_market)
                 # Convert result back to datetime
                 start_dt = datetime.fromisoformat(start_dt_str.replace('Z', ''))
                 end_dt = datetime.fromisoformat(end_dt_str.replace('Z', ''))
@@ -1264,6 +1269,7 @@ class FetchAmazonDataView(View):
                     
                     # Process the data
                     mssql_df, azure_df = process_amazon_data(orders, order_items, marketplace_name)
+                    print("azure_df length: ", len(azure_df))
                     
                     processing_duration = time.time() - processing_start_time
                     logger.info(f"✅ Data processing completed in {processing_duration:.2f}s")
@@ -1514,7 +1520,8 @@ class FetchAmazonDataView(View):
         """
         Convert both start and end dates from local timezones to UTC:
         - UK: assumes input is in GMT/BST (Europe/London)
-        - Others: assumes input is in MET (Europe/Paris)
+        - US/CA: assumes input is in PST/PDT (America/Los_Angeles)
+        - Others (EU): assumes input is in MET/CET (Europe/Paris)
         Returns ISO 8601 format strings ending with 'Z'.
         """
 
@@ -1524,12 +1531,17 @@ class FetchAmazonDataView(View):
 
         # Timezones
         london = pytz.timezone('Europe/London')  # Handles BST/GMT transitions
-        met = pytz.timezone('Europe/Paris')
+        met = pytz.timezone('Europe/Paris')      # Handles MET/CET transitions
+        pacific = pytz.timezone('America/Los_Angeles')  # Handles PST/PDT transitions
         utc = pytz.utc
 
-        if marketplace.upper() == 'UK':
+        market_upper = marketplace.upper()
+        if market_upper == 'UK':
             start_utc = london.localize(start_naive).astimezone(utc)
             end_utc = london.localize(end_naive).astimezone(utc)
+        elif market_upper in ('US', 'CA'):
+            start_utc = pacific.localize(start_naive).astimezone(utc)
+            end_utc = pacific.localize(end_naive).astimezone(utc)
         else:
             start_utc = met.localize(start_naive).astimezone(utc)
             end_utc = met.localize(end_naive).astimezone(utc)
@@ -1657,6 +1669,13 @@ class FetchAmazonDataView(View):
         try:
             all_orders = []
             next_token = None
+            # Retry/backoff tuning with safe fallbacks
+            max_attempts = getattr(self, 'MAX_RETRIES', 3)
+            base_retry_delay = getattr(self, 'BASE_RETRY_DELAY', 1.0)
+            jitter_range = getattr(self, 'JITTER_RANGE', 0.2)
+            max_retry_delay = getattr(self, 'MAX_RETRY_DELAY', 60.0)
+            # Gradually reduce page size on retries
+            page_sizes = [100, 50, 20]
             
             while True:
                 # Prepare request parameters
@@ -1665,18 +1684,56 @@ class FetchAmazonDataView(View):
                     'CreatedAfter': start_date,
                     'CreatedBefore': end_date,
                     'OrderStatuses': 'Shipped,Unshipped,PartiallyShipped,Canceled,Unfulfillable',
-                    'MaxResultsPerPage': 100  # Maximum allowed by Amazon
+                    'MaxResultsPerPage': page_sizes[0]  # Try largest first
                 }
                 
                 if next_token:
                     params['NextToken'] = next_token
                 
-                # Make the API request
+                # Make the API request with retries and backoff
                 url = f"{base_url}{self.ORDERS_ENDPOINT}"
-                logger.info(f"🔍 Amazon API Request: {url}")
-                logger.info(f"🔍 Request params: {params}")
-                response = self.make_rate_limited_request('GET', url, headers, params=params)
-                logger.info(f"🔍 Amazon API Response status: {response.status_code}")
+                attempt_response = None
+                for attempt in range(1, max_attempts + 1):
+                    # Degrade page size as attempts increase
+                    params['MaxResultsPerPage'] = page_sizes[min(attempt - 1, len(page_sizes) - 1)]
+                    logger.info(f"🔍 Amazon API Request (attempt {attempt}/{max_attempts}): {url}")
+                    logger.info(f"🔍 Request params: {params}")
+                    try:
+                        attempt_response = self.make_rate_limited_request('GET', url, headers, params=params)
+                        logger.info(f"🔍 Amazon API Response status: {attempt_response.status_code} (attempt {attempt})")
+                        break  # success
+                    except requests.exceptions.RequestException as req_err:
+                        err_str = str(req_err)
+                        lower_err = err_str.lower()
+                        # Determine retry delay
+                        retry_delay = base_retry_delay * (2 ** (attempt - 1))
+                        # Prefer Retry-After when present
+                        if 'retry_after=' in lower_err:
+                            try:
+                                after_str = lower_err.split('retry_after=')[-1]
+                                digits = ''.join(ch for ch in after_str if ch.isdigit())
+                                if digits:
+                                    retry_delay = max(retry_delay, float(digits))
+                            except Exception:
+                                pass
+                        # Apply jitter
+                        try:
+                            import random
+                            jitter = retry_delay * jitter_range * (random.random() * 2 - 1)
+                            retry_delay = min(max_retry_delay, max(1.0, retry_delay + jitter))
+                        except Exception:
+                            retry_delay = min(max_retry_delay, retry_delay)
+
+                        if attempt < max_attempts:
+                            logger.warning(f"🔄 Orders request attempt {attempt} failed: {err_str}. Retrying in {retry_delay:.1f}s ...")
+                            time.sleep(retry_delay)
+                        else:
+                            logger.error(f"❌ Orders request failed after {max_attempts} attempts: {err_str}")
+                            # Bubble up to outer except to produce structured error
+                            raise
+
+                # If we didn't break with a response, raise to be safe
+                response = attempt_response
                 
                 if response.status_code != 200:
                     error_info = self.handle_api_error(response, 'fetch orders')
@@ -2157,8 +2214,8 @@ class FetchAmazonDataView(View):
         batch_items = {}
         batch_failures = []
             
-        # Use ThreadPoolExecutor with conservative concurrency
-        max_workers = min(2, len(batch))  # Very conservative concurrency
+        # Use ThreadPoolExecutor with moderate concurrency within burst allowance
+        max_workers = min(8, len(batch))
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_order = {
@@ -2256,7 +2313,16 @@ class FetchAmazonDataView(View):
                     
                     # Adjust delay based on error type
                     if error_type == "rate_limit":
-                        retry_delay *= 3  # Triple the delay for rate limit errors (more conservative)
+                        # If make_rate_limited_request provided Retry-After, prefer it
+                        try:
+                            if 'retry_after=' in error_str:
+                                retry_after_val = error_str.split('retry_after=')[-1]
+                                retry_after_val = ''.join(ch for ch in retry_after_val if ch.isdigit())
+                                if retry_after_val:
+                                    retry_delay = max(float(retry_after_val), retry_delay)
+                        except Exception:
+                            pass
+                        retry_delay *= 1.5  # Slightly increase to reduce immediate re-throttle
                     elif error_type == "authentication":
                         retry_delay *= 2  # Double delay for auth errors to allow token refresh
                     elif error_type == "service_unavailable":
@@ -2353,14 +2419,14 @@ class FetchAmazonDataView(View):
             elif response.status_code == 429:
                 retry_after = int(response.headers.get('Retry-After', 60))
                 logger.warning(f"🚫 Rate limited by Amazon. Retry after: {retry_after}s")
-                time.sleep(retry_after + 5)  # Add 5 second buffer
-                raise requests.exceptions.RequestException(f"Rate limited (429), retry after {retry_after}s")
+                # Do not sleep here; let caller control backoff to avoid double-sleep
+                raise requests.exceptions.RequestException(f"Rate limited (429)|retry_after={retry_after}")
             
             elif response.status_code == 503:
                 retry_after = int(response.headers.get('Retry-After', 30))
                 logger.warning(f"🔧 Service unavailable. Retry after: {retry_after}s")
-                time.sleep(retry_after)
-                raise requests.exceptions.RequestException(f"Service unavailable (503), retry after {retry_after}s")
+                # Do not sleep here; let caller control backoff
+                raise requests.exceptions.RequestException(f"Service unavailable (503)|retry_after={retry_after}")
             
             elif response.status_code >= 500:
                 logger.warning(f"🚨 Server error: {response.status_code}")
@@ -2568,13 +2634,14 @@ class FetchAmazonDataView(View):
             logger.warning(f"📉 Decreased batch size due to failures: {old_size} → {self.current_batch_size}")
     
     def _calculate_batch_delay(self, consecutive_failures: int) -> int:
-        """Calculate delay between batches based on failure history."""
-        base_delay = 15  # Base 15 second delay
-        
-        # Add progressive delay for consecutive failures
-        failure_penalty = min(consecutive_failures * 10, 60)  # Cap at 60 seconds
-        
-        return base_delay + failure_penalty
+        """Calculate delay between order-items batches based on items rate limiter and failures."""
+        # No base delay when healthy
+        base_delay = 0
+        # Add progressive delay only when failures are happening (e.g., 429/503)
+        failure_penalty = min(consecutive_failures * 5, 30)  # Cap at 30 seconds
+        # Only consider the order items limiter here to avoid unrelated 60s waits from orders limiter
+        limiter_wait = int(math.ceil(max(0.0, self.order_items_rate_limiter.get_wait_time())))
+        return max(base_delay + failure_penalty, limiter_wait)
     
     def _calculate_estimated_time(self, total_orders: int) -> str:
         """Calculate estimated processing time for given number of orders."""
@@ -2611,23 +2678,36 @@ class FetchAmazonDataView(View):
         try:
             order_id = order['AmazonOrderId']
             url = f"{base_url}{self.ORDER_ITEMS_ENDPOINT.format(order_id=order_id)}"
-            
-            response = self.make_rate_limited_request('GET', url, headers, is_order_items=True)
-            
-            if response.status_code != 200:
-                error_info = self.handle_api_error(response, f'fetch items for order {order_id}')
-                return {
-                    'success': False,
-                    'error': error_info['error'],
-                    'details': error_info['details']
-                }
-            
-            data = response.json()
-            # Amazon SP-API returns order items in payload.OrderItems structure
-            payload = data.get('payload', {})
+
+            all_items = []
+            next_token = None
+            while True:
+                params = {}
+                if next_token:
+                    params['NextToken'] = next_token
+
+                response = self.make_rate_limited_request('GET', url, headers, params=params if params else None, is_order_items=True)
+
+                if response.status_code != 200:
+                    error_info = self.handle_api_error(response, f'fetch items for order {order_id}')
+                    return {
+                        'success': False,
+                        'error': error_info['error'],
+                        'details': error_info['details']
+                    }
+
+                data = response.json()
+                payload = data.get('payload', {})
+                items = payload.get('OrderItems', [])
+                all_items.extend(items)
+
+                next_token = payload.get('NextToken')
+                if not next_token:
+                    break
+
             return {
                 'success': True,
-                'items': payload.get('OrderItems', [])
+                'items': all_items
             }
             
         except Exception as e:

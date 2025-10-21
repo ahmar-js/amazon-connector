@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { format } from 'date-fns'
 import apiClient from '@/lib/api'
+import MARKETPLACES, { getEnabledMarketplaceCodes } from '@/lib/marketplaces'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
@@ -32,11 +33,9 @@ type Schedule = {
   reportScheduleId: string
 }
 
-const MARKETPLACE_LABEL: Record<string,string> = {
-  IT: 'Italy (IT)',
-  DE: 'Germany (DE)',
-  UK: 'United Kingdom (UK)'
-}
+const MARKETPLACE_LABEL: Record<string,string> = Object.fromEntries(
+  Object.values(MARKETPLACES).map(m => [m.code, `${m.name || m.code} (${m.code})`])
+)
 
 export function SchedulesTable({ reloadSignal }: Props) {
   const [loading, setLoading] = useState(true)
@@ -59,7 +58,8 @@ export function SchedulesTable({ reloadSignal }: Props) {
       setLoading(true)
       setError(null)
       // Ask backend for all known marketplaces and our report type
-      const query = `?marketplaces=IT,DE,UK&reportTypes=GET_FBA_MYI_ALL_INVENTORY_DATA`
+  const enabledCodes = getEnabledMarketplaceCodes().join(',')
+  const query = `?marketplaces=${enabledCodes}&reportTypes=GET_FBA_MYI_ALL_INVENTORY_DATA`
       const res = await apiClient.get(`/inventory/report-schedules/list/${query}`)
       const data = res.data
       if (!data?.success || !data?.results) {
@@ -68,7 +68,7 @@ export function SchedulesTable({ reloadSignal }: Props) {
       }
       // Flatten
       const flattened: Schedule[] = []
-      ;(['IT','DE','UK'] as const).forEach(code => {
+  ;(getEnabledMarketplaceCodes() as string[]).forEach(code => {
         const node = data.results?.[code]
         const list = node?.schedules?.reportSchedules || []
         list.forEach((s: any) => {
@@ -137,9 +137,11 @@ export function SchedulesTable({ reloadSignal }: Props) {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="ALL">All Regions</SelectItem>
-                  <SelectItem value="IT">Italy (IT)</SelectItem>
-                  <SelectItem value="DE">Germany (DE)</SelectItem>
-                  <SelectItem value="UK">United Kingdom (UK)</SelectItem>
+                  {Object.values(MARKETPLACES).map(m => (
+                    <SelectItem key={m.code} value={m.code} disabled={m.disabled}>
+                      {m.name ? `${m.name} (${m.code})` : m.code}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
               <Button onClick={load} disabled={loading} className="cursor-pointer">

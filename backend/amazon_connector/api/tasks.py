@@ -7,6 +7,7 @@ from .models import MarketplaceLastRun
 from django.utils import timezone
 import os, json
 import requests
+from .marketplaces import get_marketplace_id, get_available_marketplaces
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,9 @@ def fetch_amazon_data(self):
         print("Fetching Amazon data...")
         logger.info("Fetching Amazon data...")
 
-        marketplaces = ['APJ6JRA9NG5V4']
+        # Use centralized marketplace mapping (IDs) instead of hard-coded literals
+        # Default to all marketplace IDs; adjust to target specific codes if needed
+        marketplaces = list(get_available_marketplaces().values())
         access_token = get_access_token()
         logger.info(f"access token: {access_token}")
 
@@ -96,7 +99,8 @@ def generate_reports(self):
     """
     try:
         print("Generating reports...")
-        marketplaces = ['IT']
+        # Default to all marketplace codes
+        marketplaces = list(get_available_marketplaces().keys())
         payload = {
             "marketplaces": marketplaces,
         }

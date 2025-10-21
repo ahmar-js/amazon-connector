@@ -7,8 +7,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Calendar } from '@/components/ui/calendar'
 import { Calendar as CalendarIcon, Clock } from 'lucide-react'
-import { Checkbox } from '@/components/ui/checkbox'
 import apiClient from '@/lib/api'
+import MARKETPLACES, { getEnabledMarketplaceCodes } from '@/lib/marketplaces'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 
 // Add callback type
@@ -36,7 +36,9 @@ export function ScheduleReport({ onScheduled }: Props) {
     { value: 'P1M', label: 'Every 1 month' },
   ]
   // Region/marketplace select (single)
-  const [marketplace, setMarketplace] = useState<string>('IT')
+  const enabled = getEnabledMarketplaceCodes()
+  const defaultMarketplace = enabled.length ? enabled[0] : 'IT'
+  const [marketplace, setMarketplace] = useState<string>(defaultMarketplace)
   const [period, setPeriod] = useState('P1D')
   // Removed manual timestamp input; using calendar + time only
   const [nextDate, setNextDate] = useState<Date | undefined>(undefined)
@@ -149,9 +151,11 @@ export function ScheduleReport({ onScheduled }: Props) {
                   <SelectValue placeholder="Select marketplace" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="IT">Italy (IT)</SelectItem>
-                  <SelectItem value="DE">Germany (DE)</SelectItem>
-                  <SelectItem value="UK">United Kingdom (UK)</SelectItem>
+                  {Object.values(MARKETPLACES).map(m => (
+                    <SelectItem key={m.code} value={m.code} disabled={m.disabled}>
+                      {m.name ? `${m.name} (${m.code})` : m.code}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             </div>
@@ -178,25 +182,31 @@ export function ScheduleReport({ onScheduled }: Props) {
                   </Button>
                 </PopoverTrigger>
                 <PopoverContent className="p-3 space-y-3">
-                  <Calendar mode="single" selected={nextDate} onSelect={(d) => {
-                    setNextDate(d)
-                    // If switching to today and selected time is in past, bump to now
-                    if (d) {
-                      const t = new Date(d); t.setHours(0,0,0,0)
-                      if (t.getTime() === today.getTime()) {
-                        if (nextTimeHM && nextTimeHM < nowHM) {
-                          setNextTimeHM(nowHM)
-                        } else if (!nextTimeHM) {
-                          setNextTimeHM(nowHM)
+                  <Calendar
+                    mode="single"
+                    captionLayout="dropdown"
+                    selected={nextDate}
+                    onSelect={(d) => {
+                      setNextDate(d)
+                      // If switching to today and selected time is in past, bump to now
+                      if (d) {
+                        const t = new Date(d); t.setHours(0,0,0,0)
+                        if (t.getTime() === today.getTime()) {
+                          if (nextTimeHM && nextTimeHM < nowHM) {
+                            setNextTimeHM(nowHM)
+                          } else if (!nextTimeHM) {
+                            setNextTimeHM(nowHM)
+                          }
                         }
                       }
-                    }
-                  }} fromDate={today} disabled={{ before: today }} />
+                    }}
+                    disabled={{ before: today }}
+                  />
                   <div className="flex items-center gap-2">
                     <Clock className="h-4 w-4 text-muted-foreground" />
                     <Input
                       type="time"
-                      step={60}
+                      step={900}
                       min={isTodaySelected ? nowHM : undefined}
                       value={nextTimeHM}
                       className="cursor-pointer"
@@ -210,10 +220,24 @@ export function ScheduleReport({ onScheduled }: Props) {
                         setUserOverrodeTime(true)
                       }}
                     />
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      className="cursor-pointer"
+                      onClick={() => {
+                        setNextTimeHM(nowHM)
+                        setUserOverrodeTime(true)
+                      }}
+                    >
+                      Now
+                    </Button>
                   </div>
                 </PopoverContent>
               </Popover>
               <div className="text-xs text-muted-foreground">Timezone: Asia/Karachi (UTC+05:00). It will be converted to UTC automatically.</div>
+              {computedUTCFromPKT && (
+                <div className="text-xs text-muted-foreground mt-1">Preview UTC time: {computedUTCFromPKT}</div>
+              )}
             </div>
             {/* Timezone fixed to Asia/Karachi by default */}
           </div>

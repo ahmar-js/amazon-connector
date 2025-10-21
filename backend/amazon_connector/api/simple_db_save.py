@@ -51,6 +51,38 @@ logger = logging.getLogger(__name__)
 #     # If we can't parse it, return None (NULL in database)
 #     return None
 import urllib.parse
+
+def _sleep_with_jitter(base_seconds: float, attempt: int):
+    """Sleep for exponential backoff with jitter."""
+    # backoff: base * 2^(attempt-1) plus 0-250ms jitter
+    delay = base_seconds * (2 ** max(0, attempt - 1))
+    jitter_ms = int(250 * (attempt % 7))  # cheap pseudo-jitter without random
+    time.sleep(delay + (jitter_ms / 1000.0))
+
+def _to_sql_with_retries(df: pd.DataFrame, *, engine, table_name: str, if_exists: str = 'append', index: bool = False, max_retries: int = 3, base_backoff: float = 1.0) -> None:
+    """
+    Write DataFrame to SQL with up to max_retries attempts and exponential backoff.
+    Logs detailed errors and re-raises on final failure.
+    """
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"➡️ to_sql attempt {attempt}/{max_retries} -> table={table_name}, rows={len(df)}")
+            df.to_sql(name=table_name, con=engine, if_exists=if_exists, index=index)
+            logger.info(f"✅ to_sql succeeded on attempt {attempt} -> table={table_name}")
+            return
+        except Exception as e:
+            last_err = e
+            logger.error(
+                f"❌ to_sql failed on attempt {attempt}/{max_retries} for table={table_name}: {e}",
+                exc_info=True,
+            )
+            if attempt < max_retries:
+                _sleep_with_jitter(base_backoff, attempt)
+            else:
+                break
+    # If here, all retries failed
+    raise last_err
 def create_mssql_connection():
     driver = "ODBC Driver 17 for SQL Server"
     server = os.getenv('MSSQL_SERVER')
@@ -93,6 +125,10 @@ def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: 
         'A1RKKUPIHCS9HS': 'amazon_api_es_test',  # Spain
         'APJ6JRA9NG5V4': 'amazon_api_it_test',   # Italy
         'A1F83G8C2ARO7P': 'amazon_api_uk_test',  # United Kingdom
+        'ATVPDKIKX0DER': 'amazon_api_usa',  # United States
+        'A2EUQ1WTGCTBG2': 'amazon_api_ca',  # Canada
+        'A13V1IB3VIYZZH': 'amazon_api_fr_test',  # France
+        
     }
     
     results = {
@@ -196,14 +232,15 @@ def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: 
                     df_clean['PurchaseDate_Materialized'] = pd.to_datetime(df_clean['PurchaseDate_Materialized'], errors='coerce')
                     logger.info("🔧 Converted PurchaseDate_Materialized to proper datetime")
                 
-                # Let pandas handle the column matching automatically
-                df_clean.to_sql(
-                    name=table_name,
-                    con=MSSQL_engine,
+                # Let pandas handle the column matching automatically with retries
+                _to_sql_with_retries(
+                    df_clean,
+                    engine=MSSQL_engine,
+                    table_name=table_name,
                     if_exists='append',
                     index=False,
-                    # method='multi',
-                    # chunksize=100
+                    max_retries=3,
+                    base_backoff=1.0,
                 )
                 
                 results['mssql_result'] = {
@@ -231,15 +268,24 @@ def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: 
         # Save Azure DataFrame
         if not azure_df.empty:
             try:
-                logger.info(f"🔄 Saving Azure data: {len(azure_df)} records to stg_tr_amazon_raw_test")
+                logger.info(f"🔄 Saving Azure data: {len(azure_df)} records to stg_tr_amazon_raw")
                 logger.info(f"Azure columns: {list(azure_df.columns)}")
                 
                 # Clean data and fix datetime columns
                 df_clean = azure_df.copy()
                 print("Azure df_clean columns: ", df_clean.columns)
-                df_clean['CLEAN_DateTime'] = pd.to_datetime(df_clean['CLEAN_DateTime'])
-                df_clean['Date'] = df_clean['CLEAN_DateTime'].dt.date
-                df_clean['Date'] = pd.to_datetime(df_clean['Date'])
+                # Ensure CLEAN_DateTime is datetime64[ns] without timezone
+                if 'CLEAN_DateTime' in df_clean.columns:
+                    df_clean['CLEAN_DateTime'] = pd.to_datetime(df_clean['CLEAN_DateTime'], errors='coerce', utc=False)
+                    # If any tz-aware slipped in, convert to naive
+                    if hasattr(df_clean['CLEAN_DateTime'].dtype, 'tz') and df_clean['CLEAN_DateTime'].dt.tz is not None:
+                        df_clean['CLEAN_DateTime'] = df_clean['CLEAN_DateTime'].dt.tz_convert('UTC').dt.tz_localize(None)
+
+                # Derive Date as date only from CLEAN_DateTime when available, else coerce
+                if 'CLEAN_DateTime' in df_clean.columns:
+                    df_clean['Date'] = pd.to_datetime(df_clean['CLEAN_DateTime'].dt.date, errors='coerce')
+                elif 'Date' in df_clean.columns:
+                    df_clean['Date'] = pd.to_datetime(df_clean['Date'], errors='coerce')
                 
                 # Handle datetime columns that might have invalid formats
                 datetime_columns = ['data_fetch_Date']
@@ -247,7 +293,13 @@ def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: 
                 for col in datetime_columns:
                     if col in df_clean.columns:
                         logger.info(f"🔧 Fixing datetime column: {col}")
-                        df_clean[col] = pd.to_datetime(df_clean[col])
+                        df_clean[col] = pd.to_datetime(df_clean[col], errors='coerce', utc=False)
+                        # Strip timezone info if present
+                        try:
+                            if hasattr(df_clean[col].dtype, 'tz') and df_clean[col].dt.tz is not None:
+                                df_clean[col] = df_clean[col].dt.tz_convert('UTC').dt.tz_localize(None)
+                        except Exception:
+                            pass
                         
                 
                 # Fill remaining NaN values
@@ -266,21 +318,21 @@ def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: 
                 #merged_df2.to_sql(f"amazon_api_{marketplace_name.lower()}", MSSQL_engine, index=False, if_exists="append")  # append # replace
                 # df_clean.to_sql("stg_tr_amazon_raw", engine_AZURE, index=False, if_exists="append")#append # replace
                 
-                # Let pandas handle the column matching automatically
-                df_clean.to_sql(
-                    name='stg_tr_amazon_raw_test',
-                    con=engine_AZURE,
+                # Let pandas handle the column matching automatically with retries
+                _to_sql_with_retries(
+                    df_clean,
+                    engine=engine_AZURE,
+                    table_name='stg_tr_amazon_raw',
                     if_exists='append',
                     index=False,
-                    # method = multi and chunksize=10 gives error (keep this commented)
-                    # method='multi', 
-                    # chunksize=100
+                    max_retries=3,
+                    base_backoff=1.0,
                 )
                 
                 results['azure_result'] = {
                     'success': True,
                     'records_saved': len(df_clean),
-                    'table_name': 'stg_tr_amazon_raw_test'
+                    'table_name': 'stg_tr_amazon_raw'
                 }
                 results['azure_success'] = True
                 results['total_records_saved'] += len(df_clean)
@@ -291,7 +343,7 @@ def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: 
                     'success': False,
                     'error': str(azure_error),
                     'records_saved': 0,
-                    'table_name': 'stg_tr_amazon_raw_test'
+                    'table_name': 'stg_tr_amazon_raw'
                 }
                 results['azure_success'] = False
                 results['errors'].append(f"Azure save failed: {str(azure_error)}")

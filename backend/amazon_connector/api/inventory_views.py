@@ -16,20 +16,11 @@ import uuid
 import pytz
 from .inventory_mssql import save_inventory_report_to_mssql
 from .inventory_azure import save_inventory_report_to_azure
-
+from .marketplaces import MARKETPLACE_IDS, get_region_from_marketplace_id, get_available_marketplaces
 # Set up logging
 logger = logging.getLogger(__name__)
 
-# Marketplace mapping
-MARKETPLACE_IDS = {
-    "IT": "APJ6JRA9NG5V4",
-    "DE": "A1PA6795UKMFR9", 
-    "UK": "A1F83G8C2ARO7P",  # Fixed: Updated to match models.py
-    # "US": "ATVPDKIKX0DER",
-    # "CA": "A2EUQ1WTGCTBG2",
-    # "FR": "A13V1IB3VIYZZH",
-    # "ES": "A1RKKUPIHCS9HS"
-}
+# Marketplace mapping centralized in backend.amazon_connector.marketplaces
 
 # Rate limiting for Amazon SP API (0.0222 requests/second, burst of 10)
 RATE_LIMIT_DELAY = 45  # seconds between requests (1/0.0222)
@@ -203,16 +194,41 @@ class FetchInventoryReport:
 
             # Convert TSV to CSV
             try:
-                # Read with error handling for encoding issues
-                df = pd.read_csv(file_path, sep='\t', encoding='utf-8', on_bad_lines='skip')
-                
-                if df.empty:
+                # Try reading with multiple encodings to handle Windows-1252 characters from Amazon
+                encodings_to_try = ['utf-8', 'cp1252', 'latin-1']
+                last_exc = None
+                df = None
+                used_encoding = None
+                for enc in encodings_to_try:
+                    try:
+                        df = pd.read_csv(file_path, sep='\t', encoding=enc)
+                        used_encoding = enc
+                        break
+                    except Exception as e:
+                        last_exc = e
+                        logger.debug(f"Failed to read TSV with encoding {enc}: {e}")
+
+                if df is None:
+                    # As a last resort, read as binary and decode with replacement, then parse via StringIO
+                    try:
+                        from io import StringIO
+                        with open(file_path, 'rb') as bf:
+                            raw = bf.read()
+                        text = raw.decode('utf-8', errors='replace')
+                        df = pd.read_csv(StringIO(text), sep='\t')
+                        used_encoding = 'utf-8-replace'
+                        logger.warning(f"Used fallback decoding with errors='replace' for file {file_path}")
+                    except Exception as e:
+                        logger.error(f"All encoding attempts failed for {file_path}: {e}")
+                        raise last_exc or e
+
+                if df is None or df.empty:
                     logger.warning(f"Downloaded file is empty or contains no valid data: {file_path}")
                     return file_path, 0
-                
-                csv_path = file_path.replace(".tsv", ".csv")
-                df.to_csv(csv_path, index=False, encoding='utf-8')
-                logger.info(f"Converted and saved to {csv_path} with {len(df)} rows")
+
+                csv_path = file_path.replace('.tsv', '.csv')
+                df.to_csv(csv_path, index=False)
+                logger.info(f"Converted and saved to {csv_path} with {len(df)} rows (encoding={used_encoding})")
                 return csv_path, len(df)
             except pd.errors.EmptyDataError:
                 logger.warning(f"Downloaded file contains no data: {file_path}")
@@ -273,16 +289,7 @@ class FetchInventoryReportView(View):
     
     def get_region_from_marketplace(self, marketplace_id):
         """Determine region based on marketplace ID"""
-        marketplace_regions = {
-            # "ATVPDKIKX0DER": "na",  # US
-            # "A2EUQ1WTGCTBG2": "na",  # CA
-            "A1PA6795UKMFR9": "eu",  # DE
-            "A1F83G8C2ARO7P": "eu",  # UK - Fixed: Updated marketplace ID
-            # "A13V1IB3VIYZZH": "eu",  # FR
-            # "A1RKKUPIHCS9HS": "eu",  # ES
-            "APJ6JRA9NG5V4": "eu",  # IT
-        }
-        return marketplace_regions.get(marketplace_id, "na")
+        return get_region_from_marketplace_id(marketplace_id)
     
     def create_activity_record(self, marketplace_id, date_from, date_to):
         """Create an activity record for tracking"""
@@ -325,7 +332,8 @@ class FetchInventoryReportView(View):
                 }, status=400)
             
             # Get marketplaces to fetch (default to all if not specified)
-            marketplaces = data.get('marketplaces', ['IT', 'DE', 'UK'])
+            default_marketplaces = list(get_available_marketplaces().keys())
+            marketplaces = data.get('marketplaces', default_marketplaces)
             if isinstance(marketplaces, str):
                 marketplaces = [marketplaces]
             
@@ -513,7 +521,7 @@ class FetchInventoryReportView(View):
             return JsonResponse({
                 'success': True,
                 'message': 'Amazon Inventory Report Fetcher',
-                'available_marketplaces': MARKETPLACE_IDS,
+                'available_marketplaces': get_available_marketplaces(),
                 'rate_limits': {
                     'requests_per_second': 0.0222,
                     'burst_limit': 10,
@@ -550,14 +558,7 @@ class CreateReportScheduleView(View):
         return creds
 
     def get_region_from_marketplace(self, marketplace_id):
-        marketplace_regions = {
-            # "ATVPDKIKX0DER": "na",  # US
-            # "A2EUQ1WTGCTBG2": "na",  # CA
-            "A1PA6795UKMFR9": "eu",  # DE
-            "A1F83G8C2ARO7P": "eu",  # UK
-            "APJ6JRA9NG5V4": "eu",  # IT
-        }
-        return marketplace_regions.get(marketplace_id, "na")
+        return get_region_from_marketplace_id(marketplace_id)
 
     def _get_access_token(self, creds):
         url = "https://api.amazon.com/auth/o2/token"
@@ -591,7 +592,8 @@ class CreateReportScheduleView(View):
         next_report_creation_time = body.get('nextReportCreationTime')  # optional local or UTC ISO timestamp
         time_zone = body.get('timeZone', 'Asia/Karachi')  # default to PKT for better UX
         report_options = body.get('reportOptions')  # optional dict
-        marketplaces = body.get('marketplaces', ['IT', 'DE', 'UK'])
+        default_marketplaces = list(get_available_marketplaces().keys())
+        marketplaces = body.get('marketplaces', default_marketplaces)
         if isinstance(marketplaces, str):
             marketplaces = [marketplaces]
 
@@ -710,14 +712,7 @@ class GetReportSchedulesView(View):
         return creds
 
     def get_region_from_marketplace(self, marketplace_id):
-        marketplace_regions = {
-            # "ATVPDKIKX0DER": "na",  # US
-            # "A2EUQ1WTGCTBG2": "na",  # CA
-            "A1PA6795UKMFR9": "eu",  # DE
-            "A1F83G8C2ARO7P": "eu",  # UK
-            "APJ6JRA9NG5V4": "eu",  # IT
-        }
-        return marketplace_regions.get(marketplace_id, "na")
+        return get_region_from_marketplace_id(marketplace_id)
 
     def _get_access_token(self, creds):
         url = "https://api.amazon.com/auth/o2/token"
@@ -741,7 +736,7 @@ class GetReportSchedulesView(View):
         if marketplaces:
             marketplaces = [m.strip() for m in marketplaces.split(',') if m.strip()]
         else:
-            marketplaces = ['IT', 'DE', 'UK']
+            marketplaces = list(get_available_marketplaces().keys())
 
         invalid = [m for m in marketplaces if m not in MARKETPLACE_IDS]
         if invalid:
@@ -829,14 +824,7 @@ class CancelReportScheduleView(View):
         return creds
 
     def get_region_from_marketplace(self, marketplace_id):
-        marketplace_regions = {
-            # "ATVPDKIKX0DER": "na",  # US
-            # "A2EUQ1WTGCTBG2": "na",  # CA
-            "A1PA6795UKMFR9": "eu",  # DE
-            "A1F83G8C2ARO7P": "eu",  # UK
-            "APJ6JRA9NG5V4": "eu",  # IT
-        }
-        return marketplace_regions.get(marketplace_id, "eu")  # default EU for our supported markets
+        return get_region_from_marketplace_id(marketplace_id)
 
     def _get_access_token(self, creds):
         url = "https://api.amazon.com/auth/o2/token"

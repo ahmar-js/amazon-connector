@@ -13,10 +13,12 @@ function Calendar({
   className,
   classNames,
   showOutsideDays = true,
-  captionLayout = "label",
+  // Use dropdown caption layout by default so month and year selectors are available
+  captionLayout = "dropdown",
   buttonVariant = "ghost",
   formatters,
   components,
+  styles,
   ...props
 }: React.ComponentProps<typeof DayPicker> & {
   buttonVariant?: React.ComponentProps<typeof Button>["variant"]
@@ -37,6 +39,13 @@ function Calendar({
         formatMonthDropdown: (date) =>
           date.toLocaleString("default", { month: "short" }),
         ...formatters,
+      }}
+      // Hint the UA to render form controls with appropriate theme for better contrast
+      styles={{
+        dropdown: {
+          colorScheme: 'light dark',
+        },
+        ...styles,
       }}
       classNames={{
         root: cn("w-fit", defaultClassNames.root),
@@ -64,19 +73,23 @@ function Calendar({
           defaultClassNames.month_caption
         ),
         dropdowns: cn(
-          "w-full flex items-center text-sm font-medium justify-center h-(--cell-size) gap-1.5",
+          "w-full flex items-center text-sm font-medium justify-center h-(--cell-size) gap-1.5 text-foreground",
           defaultClassNames.dropdowns
         ),
         dropdown_root: cn(
-          "relative has-focus:border-ring border border-input shadow-xs has-focus:ring-ring/50 has-focus:ring-[3px] rounded-md",
+          "relative has-focus:border-ring border border-input shadow-xs has-focus:ring-ring/50 has-focus:ring-[3px] rounded-md bg-background text-foreground dark:[color-scheme:dark] [color-scheme:light]",
           defaultClassNames.dropdown_root
         ),
-        dropdown: cn("absolute inset-0 opacity-0", defaultClassNames.dropdown),
+        // Keep the native <select> invisible while clickable; hint OS to use dark scheme when applicable
+        dropdown: cn(
+          "absolute inset-0 opacity-0 [color-scheme:light] dark:[color-scheme:dark] [color:inherit]",
+          defaultClassNames.dropdown
+        ),
         caption_label: cn(
           "select-none font-medium",
           captionLayout === "label"
             ? "text-sm"
-            : "rounded-md pl-2 pr-1 flex items-center gap-1 text-sm h-8 [&>svg]:text-muted-foreground [&>svg]:size-3.5",
+            : "rounded-md h-8 px-2 inline-flex items-center gap-1 text-sm border border-input bg-muted text-foreground hover:bg-muted/80 transition-colors cursor-pointer [&>svg]:text-muted-foreground [&>svg]:size-3.5",
           defaultClassNames.caption_label
         ),
         table: "w-full border-collapse",

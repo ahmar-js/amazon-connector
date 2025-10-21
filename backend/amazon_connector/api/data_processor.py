@@ -15,6 +15,8 @@ from typing import Dict, List, Tuple, Optional
 import warnings
 import os
 
+import pytz
+
 # Suppress pandas warnings for cleaner output
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
@@ -38,7 +40,10 @@ class AmazonDataProcessor:
         'Amazon.co.uk': {'region': 'UK', 'country': 'United Kingdom', 'company': 'B2Fitinss'},
         'Amazon.es': {'region': 'ES', 'country': 'Spain', 'company': 'B2fitness LTD'},
         'Amazon.de': {'region': 'DE', 'country': 'Germany', 'company': 'B2Fitinss'},
-        'Amazon.it': {'region': 'IT', 'country': 'Italy', 'company': 'B2Fitinss'}
+        'Amazon.it': {'region': 'IT', 'country': 'Italy', 'company': 'B2Fitinss'},
+        'Amazon.com': {'region': 'US', 'country': 'United States', 'company': 'brandsinn'},
+        'Amazon.ca': {'region': 'CA', 'country': 'Canada', 'company': 'brandsinn'},
+        'Amazon.fr': {'region': 'FR', 'country': 'France', 'company': 'RDXINC LTD '},
     }
     
     def __init__(self):
@@ -167,6 +172,54 @@ class AmazonDataProcessor:
         except Exception as e:
             logger.error(f"Error converting timestamp {utc_timestamp}: {str(e)}")
             return None
+    def utc_to_pt(self, utc_dt_str):
+        """
+        Convert a UTC datetime string (ISO format) to Pacific Time (PT).
+
+        Args:
+            utc_dt_str (str|datetime): UTC datetime string like '2025-10-20T18:30:00Z' or a datetime
+
+        Returns:
+            datetime | None: timezone-naive datetime in Pacific Time, or None if input is null/invalid
+        """
+        try:
+            # Handle nulls
+            if pd.isna(utc_dt_str) or utc_dt_str is None or utc_dt_str == '':
+                return None
+
+            # Define timezones
+            utc = pytz.utc
+            pacific = pytz.timezone("America/Los_Angeles")
+
+            # Normalize to string if not datetime
+            if isinstance(utc_dt_str, datetime):
+                utc_dt = utc_dt_str
+            else:
+                s = str(utc_dt_str).strip()
+                if "Z" in s:
+                    s = s.replace("Z", "")
+                try:
+                    utc_dt = datetime.fromisoformat(s)
+                except ValueError:
+                    # Fallback to pandas parser
+                    parsed = pd.to_datetime(s, errors='coerce', utc=False)
+                    if pd.isna(parsed):
+                        logger.warning(f"Could not parse UTC datetime for PT conversion: {utc_dt_str}")
+                        return None
+                    utc_dt = parsed.to_pydatetime()
+
+            # Ensure timezone-aware UTC
+            if utc_dt.tzinfo is None:
+                utc_dt = utc.localize(utc_dt)
+            else:
+                utc_dt = utc_dt.astimezone(utc)
+
+            # Convert to PT (handles DST) and return timezone-naive (strip tzinfo)
+            pt_dt = utc_dt.astimezone(pacific)
+            return pt_dt.replace(tzinfo=None)
+        except Exception as e:
+            logger.error(f"Error converting UTC to PT for value '{utc_dt_str}': {e}")
+            return None
     
     def _convert_timezone_optimized(self, utc_series: pd.Series, marketplace_name: str) -> pd.Series:
         """
@@ -203,6 +256,8 @@ class AmazonDataProcessor:
         logger.info("Using apply method for timezone conversion (slower but more robust)")
         if marketplace_name == "UK":
             return utc_series.apply(self.convert_utc_to_bst)
+        elif marketplace_name in ["CA", "US"]:
+            return utc_series.apply(self.utc_to_pt)
         else:
             return utc_series.apply(self.convert_utc_to_mest)
     
@@ -370,83 +425,186 @@ class AmazonDataProcessor:
         
         return df
     
+    # def _calculate_vat_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
+    #     """
+    #     Vectorized VAT calculations for all marketplaces simultaneously.
+        
+    #     Args:
+    #         df: Input DataFrame
+            
+    #     Returns:
+    #         DataFrame with VAT calculations
+    #     """
+    #     # Initialize new columns
+    #     df['Promotional_Tax'] = 0.0
+    #     df['vat%'] = 0.0
+    #     df['Price'] = 0.0
+    #     df['VAT'] = 0.0
+    #     df['unit_price(vat_exclusive)'] = 0.0
+    #     df['item_total'] = 0.0
+        
+    #     # Process each marketplace
+    #     for marketplace, vat_info in self.VAT_RATES.items():
+    #         # Create mask for current marketplace
+    #         mask = (df['SalesChannel'] == marketplace) | (df['SalesChannel'] == 'Non-Amazon')
+            
+    #         if not mask.any():
+    #             continue
+            
+    #         # Fill NaN values with 0 for calculations (only if columns exist)
+    #         if 'PromotionDiscount.Amount' in df.columns:
+    #             df.loc[mask, 'PromotionDiscount.Amount'] = df.loc[mask, 'PromotionDiscount.Amount'].fillna(0)
+    #         else:
+    #             df['PromotionDiscount.Amount'] = 0
+                
+    #         if 'ItemPrice.Amount' in df.columns:
+    #             df.loc[mask, 'ItemPrice.Amount'] = df.loc[mask, 'ItemPrice.Amount'].fillna(0)
+    #         else:
+    #             df['ItemPrice.Amount'] = 0
+                
+    #         if 'ItemTax.Amount' in df.columns:
+    #             df.loc[mask, 'ItemTax.Amount'] = df.loc[mask, 'ItemTax.Amount'].fillna(0)
+    #         else:
+    #             df['ItemTax.Amount'] = 0
+            
+    #         # Vectorized calculations
+    #         df.loc[mask, 'Promotional_Tax'] = (
+    #             df.loc[mask, 'PromotionDiscount.Amount'] * vat_info['multiplier'] - 
+    #             df.loc[mask, 'PromotionDiscount.Amount']
+    #         )
+            
+    #         # VAT percentage
+    #         df.loc[mask, 'vat%'] = vat_info['percentage']
+    #         df.loc[mask & (df['ItemTax.Amount'] == 0), 'vat%'] = 0
+            
+    #         # Set Promotional_Tax to 0 where ItemTax.Amount is 0
+    #         df.loc[mask & (df['ItemTax.Amount'] == 0), 'Promotional_Tax'] = 0
+            
+    #         # Calculate Price, VAT, and other fields
+    #         df.loc[mask, 'Price'] = df.loc[mask, 'ItemPrice.Amount'] + df.loc[mask, 'Promotional_Tax']
+    #         df.loc[mask, 'VAT'] = df.loc[mask, 'Price'] * df.loc[mask, 'vat%']
+    #         df.loc[mask, 'unit_price(vat_exclusive)'] = df.loc[mask, 'Price'] - df.loc[mask, 'VAT']
+    #         df.loc[mask, 'item_total'] = (
+    #             df.loc[mask, 'Price'] - 
+    #             df.loc[mask, 'PromotionDiscount.Amount'] - 
+    #             df.loc[mask, 'Promotional_Tax']
+    #         )
+            
+    #         # Special case for zero promotional tax and discount
+    #         zero_promo_mask = mask & (df['Promotional_Tax'] == 0) & (df['PromotionDiscount.Amount'] == 0)
+    #         df.loc[zero_promo_mask, 'unit_price(vat_exclusive)'] = (
+    #             df.loc[zero_promo_mask, 'Price'] - df.loc[zero_promo_mask, 'ItemTax.Amount']
+    #         )
+            
+            
+        
+    #     # Round all calculated columns
+    #     calc_columns = ['ItemTax.Amount', 'Promotional_Tax', 'Price', 'unit_price(vat_exclusive)', 'item_total']
+    #     df[calc_columns] = df[calc_columns].round(2)
+        
+    #     return df
+    
+    
+    '''This function is handles the new calcualtions for US and CA. Logics given by zeeshan bukhari. As if we get any issues in future we can revert back to old function added in comment above'''
     def _calculate_vat_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Vectorized VAT calculations for all marketplaces simultaneously.
-        
-        Args:
-            df: Input DataFrame
-            
-        Returns:
-            DataFrame with VAT calculations
         """
-        # Initialize new columns
+
+        # Initialize output columns
         df['Promotional_Tax'] = 0.0
         df['vat%'] = 0.0
         df['Price'] = 0.0
         df['VAT'] = 0.0
         df['unit_price(vat_exclusive)'] = 0.0
         df['item_total'] = 0.0
-        
-        # Process each marketplace
-        for marketplace, vat_info in self.VAT_RATES.items():
-            # Create mask for current marketplace
-            mask = (df['SalesChannel'] == marketplace) | (df['SalesChannel'] == 'Non-Amazon')
-            
+
+        # === 1️⃣ Handle US/CA regions first ===
+        for region in ['Amazon.com', 'Amazon.ca']:
+            mask = (df['SalesChannel'] == region)
             if not mask.any():
                 continue
-            
-            # Fill NaN values with 0 for calculations (only if columns exist)
-            if 'PromotionDiscount.Amount' in df.columns:
-                df.loc[mask, 'PromotionDiscount.Amount'] = df.loc[mask, 'PromotionDiscount.Amount'].fillna(0)
-            else:
-                df['PromotionDiscount.Amount'] = 0
-                
-            if 'ItemPrice.Amount' in df.columns:
-                df.loc[mask, 'ItemPrice.Amount'] = df.loc[mask, 'ItemPrice.Amount'].fillna(0)
-            else:
-                df['ItemPrice.Amount'] = 0
-                
-            if 'ItemTax.Amount' in df.columns:
-                df.loc[mask, 'ItemTax.Amount'] = df.loc[mask, 'ItemTax.Amount'].fillna(0)
-            else:
-                df['ItemTax.Amount'] = 0
-            
-            # Vectorized calculations
+
+            # Fill NaN safely
+            for col in ['PromotionDiscount.Amount', 'ItemPrice.Amount', 'ItemTax.Amount',
+                        'ShippingTax.Amount', 'ShippingPrice.Amount']:
+                if col in df.columns:
+                    df.loc[mask, col] = df.loc[mask, col].fillna(0)
+                else:
+                    df[col] = 0.0
+
+            # Apply US/CA logic directly
             df.loc[mask, 'Promotional_Tax'] = (
-                df.loc[mask, 'PromotionDiscount.Amount'] * vat_info['multiplier'] - 
-                df.loc[mask, 'PromotionDiscount.Amount']
+                df.loc[mask, 'PromotionDiscount.Amount'] * 0
+                - df.loc[mask, 'PromotionDiscount.Amount']
             )
-            
-            # VAT percentage
+
+            df.loc[mask, 'vat%'] = 0
+            df.loc[mask & (df['ItemTax.Amount'] == 0), 'Promotional_Tax'] = 0
+            df.loc[mask, 'Price'] = 0
+            df.loc[mask, 'VAT'] = 0
+            df.loc[mask, 'unit_price(vat_exclusive)'] = df.loc[mask, 'ItemPrice.Amount']
+
+            # item_total = ShippingTax + ShippingPrice + ItemTax
+            df.loc[mask, 'item_total'] = (
+                df.loc[mask, 'ShippingTax.Amount']
+                + df.loc[mask, 'ShippingPrice.Amount']
+                + df.loc[mask, 'ItemTax.Amount']
+            )
+            # item_total = ShippingTax.Amount  + ShippingPrice.Amount + ItemTax.Amount(vat)   - ShippingDiscount.Amount (formula given by zeeshan bukhari) V0
+            # item_total = ItemPrice.Amount(item_subtotal) + ShippingTax.Amount  + ShippingPrice.Amount + ItemTax.Amount(vat)  -  ShippingDiscount.Amount (formula given by zeeshan bukhari) V1
+            # item_total = ItemPrice.Amount(item_subtotal) + ShippingTax.Amount  + ShippingPrice.Amount + ItemTax.Amount(vat) -  ShippingDiscount.Amount - PromotionDiscount.Amount(promotion)  (formula given by zeeshan bukhari) V2
+            df.loc[mask, 'item_total'] = df.loc[mask, 'ItemPrice.Amount'] + df.loc[mask, 'ShippingTax.Amount'] + df.loc[mask, 'ShippingPrice.Amount'] + df.loc[mask, 'ItemTax.Amount'] - df.loc[mask, 'ShippingDiscount.Amount'] - df.loc[mask, 'PromotionDiscount.Amount']
+
+        # === 2️⃣ Handle all other marketplaces ===
+        for marketplace, vat_info in self.VAT_RATES.items():
+            # Skip US and CA since already processed
+            if marketplace in ['Amazon.com', 'Amazon.ca']:
+                continue
+
+            mask = (df['SalesChannel'] == marketplace) | (df['SalesChannel'] == 'Non-Amazon')
+            if not mask.any():
+                continue
+
+            # Fill NaN safely
+            for col in ['PromotionDiscount.Amount', 'ItemPrice.Amount', 'ItemTax.Amount']:
+                if col in df.columns:
+                    df.loc[mask, col] = df.loc[mask, col].fillna(0)
+                else:
+                    df[col] = 0.0
+
+            # Generic VAT logic
+            df.loc[mask, 'Promotional_Tax'] = (
+                df.loc[mask, 'PromotionDiscount.Amount'] * vat_info['multiplier']
+                - df.loc[mask, 'PromotionDiscount.Amount']
+            )
             df.loc[mask, 'vat%'] = vat_info['percentage']
             df.loc[mask & (df['ItemTax.Amount'] == 0), 'vat%'] = 0
-            
-            # Set Promotional_Tax to 0 where ItemTax.Amount is 0
             df.loc[mask & (df['ItemTax.Amount'] == 0), 'Promotional_Tax'] = 0
-            
-            # Calculate Price, VAT, and other fields
+
             df.loc[mask, 'Price'] = df.loc[mask, 'ItemPrice.Amount'] + df.loc[mask, 'Promotional_Tax']
             df.loc[mask, 'VAT'] = df.loc[mask, 'Price'] * df.loc[mask, 'vat%']
             df.loc[mask, 'unit_price(vat_exclusive)'] = df.loc[mask, 'Price'] - df.loc[mask, 'VAT']
             df.loc[mask, 'item_total'] = (
-                df.loc[mask, 'Price'] - 
-                df.loc[mask, 'PromotionDiscount.Amount'] - 
-                df.loc[mask, 'Promotional_Tax']
+                df.loc[mask, 'Price']
+                - df.loc[mask, 'PromotionDiscount.Amount']
+                - df.loc[mask, 'Promotional_Tax']
             )
-            
-            # Special case for zero promotional tax and discount
+
             zero_promo_mask = mask & (df['Promotional_Tax'] == 0) & (df['PromotionDiscount.Amount'] == 0)
             df.loc[zero_promo_mask, 'unit_price(vat_exclusive)'] = (
                 df.loc[zero_promo_mask, 'Price'] - df.loc[zero_promo_mask, 'ItemTax.Amount']
             )
-        
-        # Round all calculated columns
-        calc_columns = ['ItemTax.Amount', 'Promotional_Tax', 'Price', 'unit_price(vat_exclusive)', 'item_total']
+
+        # Round results
+        calc_columns = [
+            'ItemTax.Amount', 'Promotional_Tax', 'Price',
+            'unit_price(vat_exclusive)', 'item_total'
+        ]
         df[calc_columns] = df[calc_columns].round(2)
-        
+
         return df
-    
+
     def _add_region_mapping(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Add region mapping efficiently using vectorized operations.
@@ -895,3 +1053,70 @@ def process_amazon_data(orders_data: List[Dict], order_items_data: List[Dict],
     """
     processor = AmazonDataProcessor()
     return processor.process_data(orders_data, order_items_data, marketplace_name) 
+
+
+
+
+
+
+
+
+
+
+
+
+#This code snippet is given by zeeshan bukhari ON 20 OCT 2025 for USA & CANADA column calculation and it should be only applied for CA & USA Region. DO NOT REMOVE THIS COMMENT FOR FURTURE REFRENCE
+'''
+elif condition8 == True:
+        ###############################   CONDITION 4
+        # Perform the calculations only on the filtered rows
+        merged_df.loc[condition4, 'Promotional_Tax'] = merged_df.loc[condition4, 'PromotionDiscount.Amount'] * 0 - merged_df.loc[condition4, 'PromotionDiscount.Amount']
+ 
+        #VAT
+        merged_df.loc[condition4, 'vat%'] = 0
+        merged_df.loc[condition4 & (merged_df['ItemTax.Amount'] == 0), 'vat%'] = 0
+ 
+        # If itemTax.Amount = 0 in the filtered rows, set Promotional_Tax to 0
+        merged_df.loc[condition4 & (merged_df['ItemTax.Amount'] == 0), 'Promotional_Tax'] = 0
+		
+		
+		
+        merged_df.loc[condition4, 'Price'] = 0
+		#here Price should be zero
+		
+		
+		
+        merged_df.loc[condition4, 'VAT'] = merged_df.loc[condition4, 'Price'] * merged_df.loc[condition4, 'vat%']
+		### here this VAT is calculate_vat column
+		
+		
+ 
+        merged_df.loc[condition4, 'unit_price(vat_exclusive)'] = merged_df.loc[condition4, 'ItemPrice.Amount']
+		
+		
+        merged_df.loc[condition4, 'item_total'] = merged_df.loc[condition4, 'ShippingTax.Amount'] + merged_df.loc[condition4, 'ShippingPrice.Amount'] + merged_df.loc[condition4, 'ItemTax.Amount']
+		### item total formul is 
+		## item_total = ShippingTax.Amount  + ShippingPrice.Amount + ItemTax.Amount(vat)						
+  
+        ## write this code (comment added by ahmer)
+        item_total = ShippingTax.Amount  + ShippingPrice.Amount + ItemTax.Amount(vat)   - ShippingDiscount.Amount (formula given by zeeshan bukhari)
+ 
+ 
+        #####where Promotional_Tax and PromotionDiscount.Amount = 0 than merged_df.loc[condition4, 'unit_price(vat_exclusive)'] = ItemTax.Amount+ Price
+        # Where both Promotional_Tax and PromotionDiscount.Amount are 0, set unit_price(vat_exclusive) to ItemTax.Amount + Price
+        
+		###will see this in future if there is any problem 
+		merged_df.loc[condition4 & (merged_df['Promotional_Tax'] == 0) & (merged_df['PromotionDiscount.Amount'] == 0), 'unit_price(vat_exclusive)'] = merged_df.loc[condition4, 'Price'] - merged_df.loc[condition4, 'ItemTax.Amount']
+'''
+
+# Formulas for these calcualtions are 
+'''
+Promotional_Tax  =  PromotionDiscount.Amount * 0  - PromotionDiscount.Amount
+vat% = 0
+vat% = 0  where   ItemTax.Amount = 0
+Promotional_Tax = 0  where  ItemTax.Amount = 0
+Price = 0
+VAT = Price * vat%
+unit_price(vat_exclusive) = ItemPrice.Amount
+item_total = ShippingTax.Amount  + ShippingPrice.Amount + ItemTax.Amount(vat) - ShippingDiscount.Amount (formula given by zeeshan bukhari)
+'''

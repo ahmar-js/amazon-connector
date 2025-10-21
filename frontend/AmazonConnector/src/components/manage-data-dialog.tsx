@@ -5,7 +5,7 @@ import { Label } from "@/components/ui/label"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command"
-import { Calendar } from "@/components/ui/calendar"
+import { DateRangePicker, type DateRange } from "@/components/ui/date-range-picker"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Progress } from "@/components/ui/progress"
 import { Badge } from "@/components/ui/badge"
@@ -15,7 +15,6 @@ import {
   Check, 
   ChevronsUpDown, 
   RefreshCw, 
-  CalendarIcon, 
   AlertCircle, 
   CheckCircle, 
   Download,
@@ -23,7 +22,6 @@ import {
   TrendingUp,
   Package,
   ShoppingCart,
-  FileText,
   X
 } from "lucide-react"
 import { 
@@ -31,23 +29,38 @@ import {
   downloadAsCSV, 
   type FetchAmazonDataRequest, 
   type FetchAmazonDataResponse,
-  type AmazonOrder,
-  type AmazonOrderItem,
   type ProcessedDataFile,
   type DownloadProcessedDataRequest,
   ApiError 
 } from "@/lib/api"
 
-// Amazon marketplaces with proper mapping
-const AMAZON_MARKETPLACES = [
-  { value: "A1F83G8C2ARO7P", label: "United Kingdom", code: "UK", domain: "amazon.co.uk", disabled: false },
-  { value: "APJ6JRA9NG5V4", label: "Italy", code: "IT", domain: "amazon.it", disabled: false },
-  { value: "A1RKKUPIHCS9HS", label: "Spain", code: "ES", domain: "amazon.es", disabled: false },
-  { value: "A1PA6795UKMFR9", label: "Germany", code: "DE", domain: "amazon.de", disabled: false },
-  { value: "A13V1IB3VIYZZH", label: "France", code: "FR", domain: "amazon.fr", disabled: false },
-  { value: "ATVPDKIKX0DER", label: "United States", code: "US", domain: "amazon.com", disabled: false },
-  { value: "A2EUQ1WTGCTBG2", label: "Canada", code: "CA", domain: "amazon.ca", disabled: false },
-] as const
+import MARKETPLACES from '@/lib/marketplaces'
+
+// Build a compatibility array similar to the previous AMAZON_MARKETPLACES shape
+const codeToDomain = (code: string) => {
+  switch (code) {
+    case 'US': return 'amazon.com'
+    case 'UK': return 'amazon.co.uk'
+    case 'CA': return 'amazon.ca'
+    case 'DE': return 'amazon.de'
+    case 'FR': return 'amazon.fr'
+    case 'IT': return 'amazon.it'
+    case 'ES': return 'amazon.es'
+    default: return 'amazon.com'
+  }
+}
+
+const AMAZON_MARKETPLACES = Object.values(MARKETPLACES).map(m => ({
+  value: m.id,
+  label: m.name || m.code,
+  code: m.code,
+  domain: codeToDomain(m.code),
+  disabled: m.disabled
+}))
+
+// Determine a sensible default marketplace id (first enabled, fallback to first entry)
+const enabledMarketplaces = AMAZON_MARKETPLACES.filter(m => !m.disabled)
+const DEFAULT_MARKETPLACE_ID = enabledMarketplaces.length ? enabledMarketplaces[0].value : (AMAZON_MARKETPLACES[0] && AMAZON_MARKETPLACES[0].value) || ''
 
 interface ManageDataDialogProps {
   isOpen: boolean
@@ -61,8 +74,8 @@ interface DialogState {
   isMarketplacePopoverOpen: boolean
   startDate?: Date
   endDate?: Date
-  isStartDatePopoverOpen: boolean
-  isEndDatePopoverOpen: boolean
+  startTimeHM: string
+  endTimeHM: string
   // Data fetching states
   isFetchingData: boolean
   fetchProgress: number
@@ -82,12 +95,12 @@ interface DialogState {
 
 export function ManageDataDialog({ isOpen, onOpenChange, onDataFetchStart, onDataFetchEnd }: ManageDataDialogProps) {
   const [dialogState, setDialogState] = useState<DialogState>({
-    selectedMarketplace: "A1F83G8C2ARO7P", // Default to UK marketplace
+  selectedMarketplace: DEFAULT_MARKETPLACE_ID,
     isMarketplacePopoverOpen: false,
     startDate: undefined,
     endDate: undefined,
-    isStartDatePopoverOpen: false,
-    isEndDatePopoverOpen: false,
+    startTimeHM: "00:00",
+    endTimeHM: "23:59",
     isFetchingData: false,
     fetchProgress: 0,
     fetchError: undefined,
@@ -120,26 +133,13 @@ export function ManageDataDialog({ isOpen, onOpenChange, onDataFetchStart, onDat
     }))
   }
 
-  const handleStartDateSelect = (date: Date | undefined) => {
-    setDialogState(prev => ({
-      ...prev,
-      startDate: date,
-      isStartDatePopoverOpen: false,
-      // Clear end date if it's before the new start date
-      endDate: prev.endDate && date && prev.endDate < date ? undefined : prev.endDate,
-      // Clear previous results when changing dates
-      fetchError: undefined,
-      fetchSuccess: false,
-      fetchedData: undefined,
-      showResults: false,
-    }))
-  }
+  // Single range change handler for DateRangePicker
 
-  const handleEndDateSelect = (date: Date | undefined) => {
+  const handleRangeChange = (range: DateRange | undefined) => {
     setDialogState(prev => ({
       ...prev,
-      endDate: date,
-      isEndDatePopoverOpen: false,
+      startDate: range?.from,
+      endDate: range?.to,
       // Clear previous results when changing dates
       fetchError: undefined,
       fetchSuccess: false,
@@ -195,10 +195,15 @@ export function ManageDataDialog({ isOpen, onOpenChange, onDataFetchStart, onDat
       }, 500)
 
       // Prepare request data
+      // Build ISO-like strings with time included (interpreted as marketplace-local by backend)
+      const formatDate = (d: Date) => format(d, 'yyyy-MM-dd')
+      const startDateStr = dialogState.startDate ? `${formatDate(dialogState.startDate)}T${dialogState.startTimeHM || '00:00'}:00Z` : ''
+      const endDateStr = dialogState.endDate ? `${formatDate(dialogState.endDate)}T${dialogState.endTimeHM || '23:59'}:00Z` : ''
+
       const request: FetchAmazonDataRequest = {
         marketplace_id: dialogState.selectedMarketplace,
-        start_date: format(dialogState.startDate, 'yyyy-MM-dd'),
-        end_date: format(dialogState.endDate, 'yyyy-MM-dd'),
+        start_date: startDateStr,
+        end_date: endDateStr,
         auto_save: dialogState.autoSaveToDatabase
         // No max_orders limit - fetch all orders in date range
       }
@@ -318,8 +323,6 @@ export function ManageDataDialog({ isOpen, onOpenChange, onDataFetchStart, onDat
     setDialogState(prev => ({
       ...prev,
       isMarketplacePopoverOpen: false,
-      isStartDatePopoverOpen: false,
-      isEndDatePopoverOpen: false,
       // Reset states when closing
       fetchError: undefined,
       fetchSuccess: false,
@@ -377,11 +380,20 @@ export function ManageDataDialog({ isOpen, onOpenChange, onDataFetchStart, onDat
   // Validate date range
   const isDateRangeValid = () => {
     if (!dialogState.startDate || !dialogState.endDate) return false
-    if (dialogState.startDate > dialogState.endDate) return false
-    
-    // Check if date range is not more than 30 days
-    const diffTime = Math.abs(dialogState.endDate.getTime() - dialogState.startDate.getTime())
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
+
+    // Build start/end with time
+    const s = new Date(dialogState.startDate)
+    const e = new Date(dialogState.endDate)
+    const [sh, sm] = (dialogState.startTimeHM || '00:00').split(':').map(Number)
+    const [eh, em] = (dialogState.endTimeHM || '23:59').split(':').map(Number)
+    s.setHours(sh || 0, sm || 0, 0, 0)
+    e.setHours(eh || 0, em || 0, 0, 0)
+
+    if (s.getTime() > e.getTime()) return false
+
+    // Check if range not more than 30 days
+    const diffTime = e.getTime() - s.getTime()
+    const diffDays = diffTime / (1000 * 60 * 60 * 24)
     return diffDays <= 30
   }
 
@@ -389,16 +401,22 @@ export function ManageDataDialog({ isOpen, onOpenChange, onDataFetchStart, onDat
     if (!dialogState.startDate || !dialogState.endDate) {
       return "Both start and end dates are required"
     }
-    if (dialogState.startDate > dialogState.endDate) {
-      return "Start date must be before or equal to end date"
+
+    const s = new Date(dialogState.startDate)
+    const e = new Date(dialogState.endDate)
+    const [sh, sm] = (dialogState.startTimeHM || '00:00').split(':').map(Number)
+    const [eh, em] = (dialogState.endTimeHM || '23:59').split(':').map(Number)
+    s.setHours(sh || 0, sm || 0, 0, 0)
+    e.setHours(eh || 0, em || 0, 0, 0)
+
+    if (s.getTime() > e.getTime()) {
+      return "Start datetime must be before or equal to end datetime"
     }
-    
-    const diffTime = Math.abs(dialogState.endDate.getTime() - dialogState.startDate.getTime())
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
+
+    const diffDays = (e.getTime() - s.getTime()) / (1000 * 60 * 60 * 24)
     if (diffDays > 30) {
       return "Date range cannot exceed 30 days (Amazon API limitation)"
     }
-    
     return null
   }
 
@@ -682,89 +700,18 @@ export function ManageDataDialog({ isOpen, onOpenChange, onDataFetchStart, onDat
               {/* Date Range Selection */}
               <div className="space-y-3">
                 <Label className="text-sm font-medium">Date Range *</Label>
-                
-                <div className="grid grid-cols-2 gap-3">
-                  {/* Start Date */}
-                  <div className="space-y-2">
-                    <Label htmlFor="startDate" className="text-xs text-muted-foreground">
-                      Start Date
-                    </Label>
-                    <Popover
-                      open={dialogState.isStartDatePopoverOpen}
-                      onOpenChange={(open) => 
-                        setDialogState(prev => ({ ...prev, isStartDatePopoverOpen: open }))
-                      }
-                    >
-                      <PopoverTrigger asChild>
-                        <Button
-                          variant="outline"
-                          className="w-full justify-start text-left font-normal"
-                        >
-                          <CalendarIcon className="mr-2 h-4 w-4" />
-                          {dialogState.startDate ? (
-                            format(dialogState.startDate, "MMM dd, yyyy")
-                          ) : (
-                            <span>Start date</span>
-                          )}
-                        </Button>
-                      </PopoverTrigger>
-                      <PopoverContent className="w-auto p-0" align="start">
-                        <Calendar
-                          mode="single"
-                          selected={dialogState.startDate}
-                          onSelect={handleStartDateSelect}
-                          disabled={(date) => {
-                            if (date > new Date()) return true
-                            if (dialogState.endDate && date > dialogState.endDate) return true
-                            return false
-                          }}
-                          initialFocus
-                        />
-                      </PopoverContent>
-                    </Popover>
-                  </div>
-
-                  {/* End Date */}
-                  <div className="space-y-2">
-                    <Label htmlFor="endDate" className="text-xs text-muted-foreground">
-                      End Date
-                    </Label>
-                    <Popover
-                      open={dialogState.isEndDatePopoverOpen}
-                      onOpenChange={(open) => 
-                        setDialogState(prev => ({ ...prev, isEndDatePopoverOpen: open }))
-                      }
-                    >
-                      <PopoverTrigger asChild>
-                        <Button
-                          variant="outline"
-                          className="w-full justify-start text-left font-normal"
-                        >
-                          <CalendarIcon className="mr-2 h-4 w-4" />
-                          {dialogState.endDate ? (
-                            format(dialogState.endDate, "MMM dd, yyyy")
-                          ) : (
-                            <span>End date</span>
-                          )}
-                        </Button>
-                      </PopoverTrigger>
-                      <PopoverContent className="w-auto p-0" align="start">
-                        <Calendar
-                          mode="single"
-                          selected={dialogState.endDate}
-                          onSelect={handleEndDateSelect}
-                          disabled={(date) => {
-                            if (date > new Date()) return true
-                            if (dialogState.startDate && date < dialogState.startDate) return true
-                            return false
-                          }}
-                          initialFocus
-                        />
-                      </PopoverContent>
-                    </Popover>
-                  </div>
-                </div>
-
+                <DateRangePicker
+                  value={{ from: dialogState.startDate, to: dialogState.endDate }}
+                  onChange={handleRangeChange}
+                  maxDays={30}
+                  numberOfMonths={2}
+                  showTimeInputs
+                  timeStepSeconds={900}
+                  startTime={dialogState.startTimeHM}
+                  endTime={dialogState.endTimeHM}
+                  onTimeChange={(st, et) => setDialogState(prev => ({ ...prev, startTimeHM: st, endTimeHM: et }))}
+                  showPresets
+                />
                 {/* Date validation message */}
                 {getDateValidationMessage() && (
                   <div className="flex items-center gap-2 text-sm text-red-600">
@@ -772,9 +719,8 @@ export function ManageDataDialog({ isOpen, onOpenChange, onDataFetchStart, onDat
                     <span>{getDateValidationMessage()}</span>
                   </div>
                 )}
-
                 <p className="text-xs text-muted-foreground">
-                  Select a date range to filter the data. Maximum 30 days allowed due to Amazon API limitations.
+                  Select a date and time range to filter the data. Maximum 30 days allowed due to Amazon API limitations.
                 </p>
               </div>
 
@@ -891,5 +837,4 @@ export function ManageDataDialog({ isOpen, onOpenChange, onDataFetchStart, onDat
 }
 
 // Export marketplaces for external use if needed
-export { AMAZON_MARKETPLACES }
 export type { ManageDataDialogProps } 
