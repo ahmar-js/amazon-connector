@@ -27,9 +27,103 @@ from .simple_db_save import save_simple
 from django.core.paginator import Paginator
 from django.db.models import Q
 import random
+import traceback
+import functools
+from enum import Enum
 
-# Set up logging
+# Enhanced logging configuration
 logger = logging.getLogger(__name__)
+
+# Configure logging with more detailed formatting
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+# Error response utilities
+class ErrorType(Enum):
+    VALIDATION_ERROR = "validation_error"
+    AUTHENTICATION_ERROR = "authentication_error"
+    AUTHORIZATION_ERROR = "authorization_error"
+    NOT_FOUND_ERROR = "not_found_error"
+    RATE_LIMIT_ERROR = "rate_limit_error"
+    NETWORK_ERROR = "network_error"
+    AMAZON_API_ERROR = "amazon_api_error"
+    INTERNAL_ERROR = "internal_error"
+    TIMEOUT_ERROR = "timeout_error"
+
+def create_error_response(error_type: ErrorType, message: str, details: str = None, 
+                         status_code: int = 400, error_code: str = None) -> JsonResponse:
+    """
+    Create standardized error responses with consistent formatting
+    """
+    response_data = {
+        'success': False,
+        'error': message,
+        'error_type': error_type.value,
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    }
+    
+    if details:
+        response_data['details'] = details
+    if error_code:
+        response_data['error_code'] = error_code
+        
+    logger.error(f"Error Response - Type: {error_type.value}, Message: {message}, Details: {details}")
+    return JsonResponse(response_data, status=status_code)
+
+def log_view_execution(func):
+    """
+    Decorator to log view method execution with timing and error handling
+    """
+    @functools.wraps(func)
+    def wrapper(self, request, *args, **kwargs):
+        start_time = time.time()
+        view_name = f"{self.__class__.__name__}.{func.__name__}"
+        
+        logger.info(f"Starting {view_name} - Method: {request.method}, Path: {request.path}")
+        
+        try:
+            result = func(self, request, *args, **kwargs)
+            execution_time = time.time() - start_time
+            logger.info(f"Completed {view_name} successfully in {execution_time:.2f}s")
+            return result
+        except Exception as e:
+            execution_time = time.time() - start_time
+            logger.error(f"Error in {view_name} after {execution_time:.2f}s: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            
+            # Return appropriate error response based on exception type
+            if isinstance(e, ValueError):
+                return create_error_response(
+                    ErrorType.VALIDATION_ERROR,
+                    "Invalid input provided",
+                    str(e)
+                )
+            elif isinstance(e, requests.exceptions.Timeout):
+                return create_error_response(
+                    ErrorType.TIMEOUT_ERROR,
+                    "Request timed out",
+                    "The operation took too long to complete"
+                )
+            elif isinstance(e, requests.exceptions.ConnectionError):
+                return create_error_response(
+                    ErrorType.NETWORK_ERROR,
+                    "Network connection failed",
+                    "Unable to connect to external services"
+                )
+            else:
+                return create_error_response(
+                    ErrorType.INTERNAL_ERROR,
+                    "An unexpected error occurred",
+                    "Please try again later or contact support if the issue persists"
+                )
+    
+    return wrapper
 
 @method_decorator(csrf_exempt, name='dispatch')
 class ConnectAmazonStoreView(View):
