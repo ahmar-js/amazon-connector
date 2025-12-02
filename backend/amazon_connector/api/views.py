@@ -3699,6 +3699,642 @@ class FetchMissingOrderItemsView(View):
             'example_order_ids': ['111-1234567-1234567', '111-7654321-7654321']
         })
 
+
+@method_decorator(csrf_exempt, name='dispatch')
+class FetchMissingOrdersView(View):
+    """
+    Fetch complete missing orders (order details + items) by their Order IDs and save to database.
+    
+    This endpoint is designed for recovering orders that failed to fetch or save during the main
+    data fetch process. It fetches both order details and order items, processes them, and 
+    automatically saves to the database.
+    
+    Key Features:
+    - Fetch orders by specific Order IDs
+    - Handles multiple marketplaces (US, CA, UK, etc.)
+    - Automatically fetches order items for each order
+    - Processes data using the same pipeline as main fetch
+    - Auto-saves to both MSSQL and Azure databases
+    - Comprehensive error handling and retry logic
+    
+    Limitation:
+    The only limitation with this endpoint is that it dont have robus rate limits according to amazon sp-api so be cautious when using it 
+    and try to only fetch one order at one call.
+    """
+    
+    # Amazon SP-API endpoints for different marketplaces
+    SP_API_BASE_URLS = {
+        # North America
+        "ATVPDKIKX0DER": "https://sellingpartnerapi-na.amazon.com",  # US
+        "A2EUQ1WTGCTBG2": "https://sellingpartnerapi-na.amazon.com",  # Canada
+        # Europe
+        "A1F83G8C2ARO7P": "https://sellingpartnerapi-eu.amazon.com",  # UK
+        "A1PA6795UKMFR9": "https://sellingpartnerapi-eu.amazon.com",  # Germany
+        "A13V1IB3VIYZZH": "https://sellingpartnerapi-eu.amazon.com",  # France
+        "APJ6JRA9NG5V4": "https://sellingpartnerapi-eu.amazon.com",   # Italy
+        "A1RKKUPIHCS9HS": "https://sellingpartnerapi-eu.amazon.com",  # Spain
+    }
+    
+    # Rate limits
+    ORDERS_MAX_REQUESTS_PER_SECOND = 0.0167  # 1 request every 60 seconds
+    ORDER_ITEMS_MAX_REQUESTS_PER_SECOND = 0.5  # 1 request every 2 seconds
+    
+    def post(self, request):
+        """
+        Fetch and save missing orders by their Order IDs.
+        
+        Expected request parameters:
+        - access_token: Amazon SP-API access token
+        - marketplace_id: Amazon marketplace ID (e.g., ATVPDKIKX0DER for US)
+        - order_ids: List of Amazon Order IDs to fetch
+        - auto_save: Boolean to auto-save to database (default: True)
+        
+        Returns:
+            JsonResponse: Contains fetched data and save results
+        """
+        logger.info("="*80)
+        logger.info("🚀 FetchMissingOrdersView.post() - START")
+        logger.info("="*80)
+        
+        try:
+            # Parse request data
+            logger.info("📥 Step 1: Parsing request body...")
+            try:
+                data = json.loads(request.body)
+                logger.info(f"✅ Request body parsed successfully")
+                logger.info(f"🔍 Request keys: {list(data.keys())}")
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ JSON decode error: {str(e)}")
+                return create_error_response(
+                    ErrorType.VALIDATION_ERROR,
+                    'Invalid JSON',
+                    f'Could not parse request body: {str(e)}',
+                    400
+                )
+            
+            # Validate required fields
+            logger.info("📋 Step 2: Validating required fields...")
+            required_fields = ['access_token', 'marketplace_id', 'order_ids']
+            missing_fields = [field for field in required_fields if not data.get(field)]
+            
+            if missing_fields:
+                logger.error(f"❌ Missing required fields: {missing_fields}")
+                return create_error_response(
+                    ErrorType.VALIDATION_ERROR,
+                    'Missing required fields',
+                    f'The following fields are required: {", ".join(missing_fields)}',
+                    400
+                )
+            logger.info(f"✅ All required fields present")
+            
+            # Extract parameters
+            logger.info("📤 Step 3: Extracting parameters...")
+            access_token = data['access_token'].strip()
+            marketplace_id = data['marketplace_id'].strip()
+            order_ids = data['order_ids']
+            auto_save = data.get('auto_save', True)  # Default to True
+            
+            logger.info(f"🔑 Access token length: {len(access_token)}")
+            logger.info(f"🌍 Marketplace ID: {marketplace_id}")
+            logger.info(f"📦 Number of order IDs: {len(order_ids)}")
+            logger.info(f"💾 Auto-save enabled: {auto_save}")
+            logger.info(f"📋 Order IDs: {order_ids}")
+            
+            # Validate order_ids
+            logger.info("🔍 Step 4: Validating order_ids...")
+            if not isinstance(order_ids, list) or len(order_ids) == 0:
+                logger.error(f"❌ Invalid order_ids: must be non-empty list, got {type(order_ids)}")
+                return create_error_response(
+                    ErrorType.VALIDATION_ERROR,
+                    'Invalid order_ids',
+                    'order_ids must be a non-empty list of Amazon Order IDs',
+                    400
+                )
+            
+            if len(order_ids) > 100:
+                logger.error(f"❌ Too many order IDs: {len(order_ids)} (max 100)")
+                return create_error_response(
+                    ErrorType.VALIDATION_ERROR,
+                    'Too many order IDs',
+                    'Maximum 100 order IDs allowed per request',
+                    400
+                )
+            logger.info(f"✅ Order IDs validation passed")
+            
+            # Get marketplace name
+            logger.info("🏪 Step 5: Resolving marketplace name...")
+            marketplace_names = {
+                "ATVPDKIKX0DER": "US",
+                "A2EUQ1WTGCTBG2": "CA",
+                "A1F83G8C2ARO7P": "UK",
+                "A1PA6795UKMFR9": "DE",
+                "A13V1IB3VIYZZH": "FR",
+                "APJ6JRA9NG5V4": "IT",
+                "A1RKKUPIHCS9HS": "ES"
+            }
+            marketplace_name = marketplace_names.get(marketplace_id, "UNKNOWN")
+            logger.info(f"✅ Marketplace: {marketplace_name} ({marketplace_id})")
+            
+            # Get base URL
+            logger.info("🔗 Step 6: Getting API base URL...")
+            base_url = self.SP_API_BASE_URLS.get(marketplace_id)
+            if not base_url:
+                logger.error(f"❌ Unsupported marketplace ID: {marketplace_id}")
+                return create_error_response(
+                    ErrorType.VALIDATION_ERROR,
+                    'Invalid marketplace',
+                    f'Marketplace ID {marketplace_id} is not supported',
+                    400
+                )
+            logger.info(f"✅ Base URL: {base_url}")
+            
+            # Setup headers
+            logger.info("📨 Step 7: Setting up request headers...")
+            headers = {
+                "x-amz-access-token": access_token,
+                "Content-Type": "application/json",
+                "User-Agent": "AmazonConnector/1.0"
+            }
+            logger.info(f"✅ Headers configured")
+            
+            logger.info(f"\n{'='*80}")
+            logger.info(f"🎯 SUMMARY: Fetching {len(order_ids)} missing orders for {marketplace_name}")
+            logger.info(f"{'='*80}\n")
+            
+            # Create activity record
+            logger.info("📝 Step 8: Creating activity record...")
+            activity = None
+            try:
+                activity = Activities.objects.create(
+                    marketplace_id=marketplace_id,
+                    activity_type='fetch_missing_orders',
+                    status='in_progress',
+                    details=f'Fetching {len(order_ids)} missing orders'
+                )
+                logger.info(f"✅ Activity record created: ID {activity.id}")
+            except Exception as activity_error:
+                logger.warning(f"⚠️ Could not create activity record: {activity_error}")
+            
+            # Step 1: Fetch individual orders
+            logger.info(f"\n{'='*80}")
+            logger.info("📦 PHASE 1: FETCHING ORDERS")
+            logger.info(f"{'='*80}\n")
+            fetch_start_time = time.time()
+            orders_result = self.fetch_orders_by_ids(headers, base_url, marketplace_id, order_ids)
+            
+            if not orders_result['success']:
+                logger.error(f"❌ Orders fetch failed!")
+                logger.error(f"   Error: {orders_result.get('error', 'Unknown error')}")
+                if activity:
+                    activity.status = 'failed'
+                    activity.error_message = orders_result.get('error', 'Unknown error')
+                    activity.save()
+                    logger.info(f"💾 Activity record updated to 'failed'")
+                
+                return JsonResponse({
+                    'success': False,
+                    'error': orders_result.get('error', 'Failed to fetch orders'),
+                    'details': orders_result.get('details', ''),
+                    'failed_order_ids': orders_result.get('failed_order_ids', [])
+                }, status=500)
+            
+            orders = orders_result['orders']
+            logger.info(f"✅ Phase 1 complete: Fetched {len(orders)}/{len(order_ids)} orders successfully")
+            if orders_result.get('failed_order_ids'):
+                logger.warning(f"⚠️ Failed to fetch {len(orders_result['failed_order_ids'])} orders: {orders_result['failed_order_ids']}")
+            
+            # Step 2: Fetch order items for each order
+            logger.info(f"\n{'='*80}")
+            logger.info("📦 PHASE 2: FETCHING ORDER ITEMS")
+            logger.info(f"{'='*80}\n")
+            items_result = self.fetch_items_for_orders(headers, base_url, orders)
+            
+            if not items_result['success']:
+                logger.error(f"❌ Order items fetch failed!")
+                logger.error(f"   Error: {items_result.get('error', 'Unknown error')}")
+                if activity:
+                    activity.status = 'failed'
+                    activity.error_message = items_result.get('error', 'Unknown error')
+                    activity.save()
+                    logger.info(f"💾 Activity record updated to 'failed'")
+                
+                return JsonResponse({
+                    'success': False,
+                    'error': items_result.get('error', 'Failed to fetch order items'),
+                    'details': items_result.get('details', ''),
+                    'orders_fetched': len(orders)
+                }, status=500)
+            
+            order_items_dict = items_result['items']
+            logger.info(f"✅ Phase 2 complete: Fetched items for {len(order_items_dict)} orders")
+            if items_result.get('failed_orders'):
+                logger.warning(f"⚠️ Failed to fetch items for {len(items_result['failed_orders'])} orders: {items_result['failed_orders']}")
+            
+            # Step 3: Structure the data (flatten order items)
+            logger.info(f"\n{'='*80}")
+            logger.info("📊 PHASE 3: STRUCTURING DATA")
+            logger.info(f"{'='*80}\n")
+            logger.info("🔄 Flattening order items...")
+            all_order_items = []
+            for order in orders:
+                order_id = order['AmazonOrderId']
+                items = order_items_dict.get(order_id, [])
+                for item in items:
+                    item['order_id'] = order_id
+                    all_order_items.append(item)
+            
+            logger.info(f"✅ Data structured: {len(orders)} orders, {len(all_order_items)} items")
+            fetch_duration = time.time() - fetch_start_time
+            logger.info(f"⏱️ Total fetch duration: {fetch_duration:.2f}s")
+            
+            # Step 4: Process and save data if auto_save is enabled
+            db_save_result = None
+            if auto_save:
+                logger.info(f"\n{'='*80}")
+                logger.info("💾 PHASE 4: PROCESSING & SAVING TO DATABASE")
+                logger.info(f"{'='*80}\n")
+                try:
+                    processing_start_time = time.time()
+                    logger.info(f"🔄 Processing data for {marketplace_name}...")
+                    logger.info(f"   Orders to process: {len(orders)}")
+                    logger.info(f"   Items to process: {len(all_order_items)}")
+                    
+                    # Process the data using the same processor as main fetch
+                    mssql_df, azure_df = process_amazon_data(orders, all_order_items, marketplace_name)
+                    
+                    processing_duration = time.time() - processing_start_time
+                    logger.info(f"✅ Data processing completed in {processing_duration:.2f}s")
+                    logger.info(f"   MSSQL DataFrame shape: {mssql_df.shape}")
+                    logger.info(f"   Azure DataFrame shape: {azure_df.shape}")
+                    logger.info(f"   MSSQL columns: {len(mssql_df.columns)}")
+                    logger.info(f"   Azure columns: {len(azure_df.columns)}")
+                    
+                    # Save to databases
+                    logger.info(f"\n💾 Saving to databases...")
+                    db_save_start_time = time.time()
+                    db_save_result = save_simple(mssql_df, azure_df, marketplace_id)
+                    db_save_duration = time.time() - db_save_start_time
+                    
+                    if db_save_result['success']:
+                        logger.info(f"✅ Database save completed in {db_save_duration:.2f}s")
+                        logger.info(f"   Total records saved: {db_save_result['total_records_saved']}")
+                        
+                        if db_save_result.get('mssql_result'):
+                            mssql_result = db_save_result['mssql_result']
+                            logger.info(f"   MSSQL: {mssql_result.get('records_saved', 0)} records")
+                            if not mssql_result.get('success'):
+                                logger.error(f"   ❌ MSSQL save issues: {mssql_result.get('error', 'Unknown')}")
+                        
+                        if db_save_result.get('azure_result'):
+                            azure_result = db_save_result['azure_result']
+                            logger.info(f"   Azure: {azure_result.get('records_saved', 0)} records")
+                            if not azure_result.get('success'):
+                                logger.error(f"   ❌ Azure save issues: {azure_result.get('error', 'Unknown')}")
+                        
+                        
+                        if activity:
+                            activity.status = 'completed'
+                            activity.orders_count = len(orders)
+                            activity.items_count = len(all_order_items)
+                            activity.details = f"Successfully fetched and saved {len(orders)} orders with {len(all_order_items)} items"
+                            activity.save()
+                            logger.info(f"💾 Activity record updated to 'completed'")
+                    else:
+                        logger.error(f"❌ Database save failed!")
+                        logger.error(f"   Errors: {db_save_result.get('errors', ['Unknown error'])}")
+                        
+                        if activity:
+                            activity.status = 'partial'
+                            activity.error_message = str(db_save_result.get('errors', []))
+                            activity.save()
+                            logger.info(f"💾 Activity record updated to 'partial'")
+                
+                except Exception as save_error:
+                    logger.error(f"❌ EXCEPTION during processing/save!")
+                    logger.error(f"   Error: {save_error}", exc_info=True)
+                    db_save_result = {
+                        'success': False,
+                        'error': str(save_error),
+                        'total_records_saved': 0
+                    }
+                    
+                    if activity:
+                        activity.status = 'failed'
+                        activity.error_message = str(save_error)
+                        activity.save()
+                        logger.info(f"💾 Activity record updated to 'failed'")
+            else:
+                logger.info(f"\n⏭️ Auto-save disabled - skipping database save")
+                if activity:
+                    activity.status = 'completed'
+                    activity.orders_count = len(orders)
+                    activity.items_count = len(all_order_items)
+                    activity.details = f"Successfully fetched {len(orders)} orders with {len(all_order_items)} items (not saved)"
+                    activity.save()
+                    logger.info(f"💾 Activity record updated to 'completed' (no save)")
+            
+            # Prepare response
+            logger.info(f"\n{'='*80}")
+            logger.info("📤 PREPARING RESPONSE")
+            logger.info(f"{'='*80}\n")
+            logger.info(f"✅ Building response data...")
+            response_data = {
+                'success': True,
+                'message': f'Successfully fetched {len(orders)} missing orders',
+                'data': {
+                    'orders': orders,
+                    'order_items': all_order_items,
+                    'metadata': {
+                        'fetched_at': datetime.utcnow().isoformat() + 'Z',
+                        'total_orders': len(orders),
+                        'total_items': len(all_order_items),
+                        'marketplace': marketplace_name,
+                        'fetch_duration': round(fetch_duration, 2)
+                    }
+                },
+                'statistics': {
+                    'requested_order_ids': len(order_ids),
+                    'fetched_orders': len(orders),
+                    'failed_orders': orders_result.get('failed_order_ids', []),
+                    'total_items': len(all_order_items)
+                }
+            }
+            
+            # Add database save results if auto_save was enabled
+            if auto_save and db_save_result:
+                response_data['database_save'] = db_save_result
+                logger.info(f"💾 Database save results included in response")
+            
+            logger.info(f"\n{'='*80}")
+            logger.info(f"✅ FetchMissingOrdersView - SUCCESS")
+            logger.info(f"   Total time: {time.time() - fetch_start_time:.2f}s")
+            logger.info(f"   Orders fetched: {len(orders)}/{len(order_ids)}")
+            logger.info(f"   Items fetched: {len(all_order_items)}")
+            if auto_save and db_save_result:
+                logger.info(f"   Records saved: {db_save_result.get('total_records_saved', 0)}")
+            logger.info(f"{'='*80}\n")
+            
+            return JsonResponse(response_data)
+        
+        except Exception as e:
+            logger.error(f"\n{'='*80}")
+            logger.error(f"❌ UNEXPECTED ERROR in FetchMissingOrdersView")
+            logger.error(f"{'='*80}")
+            logger.error(f"Error: {e}", exc_info=True)
+            
+            if 'activity' in locals() and activity:
+                activity.status = 'failed'
+                activity.error_message = str(e)
+                activity.save()
+                logger.info(f"💾 Activity record updated to 'failed'")
+            
+            return JsonResponse({
+                'success': False,
+                'error': 'Unexpected error occurred',
+                'details': str(e)
+            }, status=500)
+    
+    def fetch_orders_by_ids(self, headers: Dict[str, str], base_url: str, marketplace_id: str, order_ids: List[str]) -> Dict:
+        """
+        Fetch individual orders by their Order IDs using Amazon's getOrder API.
+        
+        Args:
+            headers: Request headers with access token
+            base_url: API base URL for the marketplace
+            marketplace_id: Amazon marketplace ID
+            order_ids: List of Order IDs to fetch
+            
+        Returns:
+            Dict containing fetched orders and failed order IDs
+        """
+        logger.info(f"🚀 fetch_orders_by_ids() - Starting to fetch {len(order_ids)} orders")
+        logger.info(f"   Base URL: {base_url}")
+        logger.info(f"   Marketplace: {marketplace_id}")
+        
+        orders = []
+        failed_order_ids = []
+        
+        for idx, order_id in enumerate(order_ids, 1):
+            try:
+                # Rate limiting - 1 request per 60 seconds for orders
+                if idx > 1:  # Don't wait before first request
+                    wait_time = 60 / self.ORDERS_MAX_REQUESTS_PER_SECOND  # ~3600 seconds = 1 hour per request
+                    logger.info(f"⏳ [{idx}/{len(order_ids)}] Rate limiting: waiting {wait_time:.1f}s...")
+                    time.sleep(wait_time)
+                
+                # Fetch single order
+                url = f"{base_url}/orders/v0/orders/{order_id}"
+                
+                logger.info(f"🔍 [{idx}/{len(order_ids)}] Fetching order: {order_id}")
+                logger.info(f"   URL: {url}")
+                
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    timeout=30
+                )
+                
+                logger.info(f"   Response status: {response.status_code}")
+                
+                if response.status_code == 200:
+                    response_data = response.json()
+                    order = response_data.get('payload')
+                    
+                    if order:
+                        orders.append(order)
+                        logger.info(f"   ✅ Order fetched successfully")
+                        logger.info(f"   Order date: {order.get('PurchaseDate', 'N/A')}")
+                        logger.info(f"   Order status: {order.get('OrderStatus', 'N/A')}")
+                    else:
+                        logger.warning(f"   ⚠️ No order data in payload")
+                        failed_order_ids.append(order_id)
+                
+                elif response.status_code == 404:
+                    logger.warning(f"   ⚠️ Order not found (404)")
+                    failed_order_ids.append(order_id)
+                
+                elif response.status_code == 429:
+                    # Rate limit exceeded - wait and retry
+                    logger.warning(f"   ⚠️ Rate limit exceeded (429) - waiting 120s...")
+                    time.sleep(120)
+                    
+                    # Retry once
+                    logger.info(f"   🔄 Retrying order: {order_id}")
+                    response = requests.get(url, headers=headers, timeout=30)
+                    logger.info(f"   Retry response status: {response.status_code}")
+                    
+                    if response.status_code == 200:
+                        response_data = response.json()
+                        order = response_data.get('payload')
+                        if order:
+                            orders.append(order)
+                            logger.info(f"   ✅ Order fetched successfully on retry")
+                        else:
+                            logger.error(f"   ❌ No order data on retry")
+                            failed_order_ids.append(order_id)
+                    else:
+                        logger.error(f"   ❌ Failed on retry: HTTP {response.status_code}")
+                        failed_order_ids.append(order_id)
+                
+                else:
+                    logger.error(f"   ❌ Failed: HTTP {response.status_code}")
+                    try:
+                        error_data = response.json()
+                        logger.error(f"   Error response: {error_data}")
+                    except:
+                        logger.error(f"   Response text: {response.text[:200]}")
+                    failed_order_ids.append(order_id)
+            
+            except requests.exceptions.Timeout:
+                logger.error(f"   ❌ Request timeout for order: {order_id}")
+                failed_order_ids.append(order_id)
+            except requests.exceptions.RequestException as e:
+                logger.error(f"   ❌ Request exception for order {order_id}: {e}")
+                failed_order_ids.append(order_id)
+            except Exception as e:
+                logger.error(f"   ❌ Unexpected error for order {order_id}: {e}")
+                failed_order_ids.append(order_id)
+        
+        logger.info(f"\n📊 Orders fetch summary:")
+        logger.info(f"   ✅ Successful: {len(orders)}")
+        logger.info(f"   ❌ Failed: {len(failed_order_ids)}")
+        if failed_order_ids:
+            logger.info(f"   Failed IDs: {failed_order_ids}")
+        
+        return {
+            'success': len(orders) > 0,
+            'orders': orders,
+            'failed_order_ids': failed_order_ids
+        }
+    
+    def fetch_items_for_orders(self, headers: Dict[str, str], base_url: str, orders: List[Dict]) -> Dict:
+        """
+        Fetch order items for a list of orders.
+        
+        Args:
+            headers: Request headers with access token
+            base_url: API base URL for the marketplace
+            orders: List of order objects
+            
+        Returns:
+            Dict containing order items by order ID
+        """
+        logger.info(f"🚀 fetch_items_for_orders() - Starting to fetch items for {len(orders)} orders")
+        logger.info(f"   Base URL: {base_url}")
+        
+        all_items = {}
+        failed_orders = []
+        
+        for idx, order in enumerate(orders, 1):
+            try:
+                order_id = order['AmazonOrderId']
+                
+                # Rate limiting - 0.5 requests per second = 2 seconds per request
+                if idx > 1:  # Don't wait before first request
+                    wait_time = 1 / self.ORDER_ITEMS_MAX_REQUESTS_PER_SECOND  # 2 seconds
+                    logger.info(f"⏳ [{idx}/{len(orders)}] Rate limiting: waiting {wait_time:.1f}s...")
+                    time.sleep(wait_time)
+                
+                # Fetch order items
+                url = f"{base_url}/orders/v0/orders/{order_id}/orderItems"
+                
+                logger.info(f"🔍 [{idx}/{len(orders)}] Fetching items for: {order_id}")
+                logger.info(f"   URL: {url}")
+                
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    timeout=30
+                )
+                
+                logger.info(f"   Response status: {response.status_code}")
+                
+                if response.status_code == 200:
+                    response_data = response.json()
+                    items = response_data.get('payload', {}).get('OrderItems', [])
+                    all_items[order_id] = items
+                    logger.info(f"   ✅ Fetched {len(items)} items successfully")
+                    for item_idx, item in enumerate(items, 1):
+                        logger.info(f"      Item {item_idx}: {item.get('SellerSKU', 'N/A')} - Qty: {item.get('QuantityOrdered', 'N/A')}")
+                
+                elif response.status_code == 429:
+                    # Rate limit - wait and retry
+                    logger.warning(f"   ⚠️ Rate limit exceeded (429) - waiting 60s...")
+                    time.sleep(60)
+                    
+                    logger.info(f"   🔄 Retrying items for: {order_id}")
+                    response = requests.get(url, headers=headers, timeout=30)
+                    logger.info(f"   Retry response status: {response.status_code}")
+                    
+                    if response.status_code == 200:
+                        response_data = response.json()
+                        items = response_data.get('payload', {}).get('OrderItems', [])
+                        all_items[order_id] = items
+                        logger.info(f"   ✅ Fetched {len(items)} items on retry")
+                    else:
+                        logger.error(f"   ❌ Failed on retry: HTTP {response.status_code}")
+                        failed_orders.append(order_id)
+                        all_items[order_id] = []
+                
+                else:
+                    logger.error(f"   ❌ Failed: HTTP {response.status_code}")
+                    try:
+                        error_data = response.json()
+                        logger.error(f"   Error response: {error_data}")
+                    except:
+                        logger.error(f"   Response text: {response.text[:200]}")
+                    failed_orders.append(order_id)
+                    all_items[order_id] = []
+            
+            except requests.exceptions.Timeout:
+                logger.error(f"   ❌ Request timeout for order items: {order_id}")
+                failed_orders.append(order_id)
+                all_items[order_id] = []
+            except requests.exceptions.RequestException as e:
+                logger.error(f"   ❌ Request exception for items {order_id}: {e}")
+                failed_orders.append(order_id)
+                all_items[order_id] = []
+            except Exception as e:
+                logger.error(f"   ❌ Unexpected error for items {order_id}: {e}")
+                failed_orders.append(order_id)
+                all_items[order_id] = []
+        
+        logger.info(f"\n📊 Items fetch summary:")
+        logger.info(f"   ✅ Successful: {len(all_items) - len(failed_orders)}")
+        logger.info(f"   ❌ Failed: {len(failed_orders)}")
+        if failed_orders:
+            logger.info(f"   Failed order IDs: {failed_orders}")
+        
+        total_items = sum(len(items) for items in all_items.values())
+        logger.info(f"   📦 Total items fetched: {total_items}")
+        
+        return {
+            'success': True,
+            'items': all_items,
+            'failed_orders': failed_orders
+        }
+    
+    def get(self, request):
+        """Handle GET requests with helpful information."""
+        return JsonResponse({
+            'message': 'Fetch Missing Orders API',
+            'methods': ['POST'],
+            'required_fields': ['access_token', 'marketplace_id', 'order_ids'],
+            'optional_fields': ['auto_save (default: true)'],
+            'description': 'Fetch complete missing orders (details + items) by Order IDs and auto-save to database',
+            'order_ids_format': 'List of Amazon Order IDs (max 100 per request)',
+            'example_order_ids': ['112-8441289-6085057', '702-7849113-9530651'],
+            'supported_marketplaces': {
+                'US': 'ATVPDKIKX0DER',
+                'CA': 'A2EUQ1WTGCTBG2',
+                'UK': 'A1F83G8C2ARO7P',
+                'DE': 'A1PA6795UKMFR9',
+                'FR': 'A13V1IB3VIYZZH',
+                'IT': 'APJ6JRA9NG5V4',
+                'ES': 'A1RKKUPIHCS9HS'
+            }
+        })
+
     def refresh_access_token_internal(self) -> Dict:
         """
         Internal method to refresh access token using stored credentials.
