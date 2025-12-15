@@ -23,6 +23,7 @@ from .inventory_views import (
     CancelReportScheduleView,
 )
 
+from .fix_purchase_date import FixPurchaseDate
 # Create router for ViewSets
 router = DefaultRouter()
 
@@ -50,6 +51,9 @@ urlpatterns = [
     path('activities/', ActivitiesListView.as_view(), name='activities_list'),
     path('activities/<uuid:activity_id>/', ActivityDetailView.as_view(), name='activity_detail'),
     path('activities/stats/', ActivitiesStatsView.as_view(), name='activities_stats'),
+    
+    # Fix Purchase Date endpoint
+    path('fix-purchase-date/', FixPurchaseDate.as_view(), name='fix_purchase_date'),
     
     # Include router URLs
     path('', include(router.urls)),

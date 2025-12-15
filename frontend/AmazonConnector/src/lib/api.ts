@@ -218,6 +218,18 @@ export interface FetchDataMetadata {
 export interface FetchAmazonDataResponse {
   orders: AmazonOrder[]
   order_items: AmazonOrderItem[]
+  data?: {
+    deduplication?: {
+      enabled: boolean
+      status: 'all_new' | 'partial_duplicates' | 'all_duplicates' | 'empty'
+      total_orders_from_api: number
+      new_orders: number
+      duplicate_orders_skipped: number
+      api_calls_saved: number
+      message: string
+      summary: string
+    }
+  }
   processed_data?: {
     mssql_records: number
     azure_records: number
@@ -227,7 +239,30 @@ export interface FetchAmazonDataResponse {
       attempted: boolean
       success: boolean | null
       records_saved: number
-      details?: any
+      details?: {
+        status?: 'success' | 'partial_success' | 'error'
+        message?: string
+        details?: {
+          mssql?: {
+            saved: number
+            skipped: number
+            success: boolean
+          }
+          azure?: {
+            saved: number
+            skipped: number
+            success: boolean
+          }
+        }
+        error?: string
+        // Legacy fields for backward compatibility
+        mssql_result?: {
+          records_saved: number
+        }
+        azure_result?: {
+          records_saved: number
+        }
+      }
     }
   }
   processing_error?: string
@@ -1215,6 +1250,31 @@ export class AmazonConnectorService {
       }
       
       // Transform other errors
+      throw transformError(error)
+    }
+  }
+
+  /**
+   * Repair purchase dates - detects and deletes anomalous date records
+   */
+  static async repairPurchaseDates(): Promise<ApiResponse<any>> {
+    try {
+      console.log('🔧 Repairing purchase dates...')
+      
+      const response: AxiosResponse<ApiResponse<any>> = await apiClient.post('/fix-purchase-date/')
+      
+      if (response.data.success) {
+        console.log('✅ Purchase dates repaired successfully:', response.data.data)
+        return response.data
+      } else {
+        throw new ApiError(
+          response.data.error || 'Failed to repair purchase dates',
+          response.status,
+          response.data.details
+        )
+      }
+    } catch (error) {
+      console.error('❌ Repair purchase dates error:', error)
       throw transformError(error)
     }
   }

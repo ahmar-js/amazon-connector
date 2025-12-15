@@ -481,6 +481,27 @@ export function ManageDataDialog({ isOpen, onOpenChange, onDataFetchStart, onDat
                     Data fetched and processed successfully!
                   </div>
                   
+                  {/* Deduplication Status */}
+                  {dialogState.fetchedData.data?.deduplication && (
+                    <div className="border-b pb-3">
+                      <div className="flex items-center gap-2 mb-2">
+                        <Badge variant="outline" className={`
+                          ${dialogState.fetchedData.data.deduplication.status === 'all_new' ? 'border-green-500 text-green-700 bg-green-50 dark:bg-green-950/30' : ''}
+                          ${dialogState.fetchedData.data.deduplication.status === 'partial_duplicates' ? 'border-blue-500 text-blue-700 bg-blue-50 dark:bg-blue-950/30' : ''}
+                          ${dialogState.fetchedData.data.deduplication.status === 'all_duplicates' ? 'border-orange-500 text-orange-700 bg-orange-50 dark:bg-orange-950/30' : ''}
+                        `}>
+                          {dialogState.fetchedData.data.deduplication.message}
+                        </Badge>
+                      </div>
+                      {dialogState.fetchedData.data.deduplication.api_calls_saved > 0 && (
+                        <div className="text-xs text-muted-foreground flex items-center gap-1">
+                          <TrendingUp className="h-3 w-3" />
+                          Saved {dialogState.fetchedData.data.deduplication.api_calls_saved} API calls by skipping duplicates
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  
                   {/* Results Summary */}
                   <div className="grid grid-cols-2 gap-4 text-sm">
                     <div className="flex items-center gap-2">
@@ -506,52 +527,100 @@ export function ManageDataDialog({ isOpen, onOpenChange, onDataFetchStart, onDat
                     <div className="border-t pt-3">
                       <p className="text-xs font-medium text-muted-foreground mb-2">Database Save Status</p>
                       <div className="space-y-2">
-                        {dialogState.fetchedData.processed_data.database_save.success ? (
-                          <div className="flex items-center gap-2 text-sm">
-                            <CheckCircle className="h-4 w-4 text-green-600" />
-                            <span className="text-green-700 font-medium">
-                              Auto-saved {dialogState.fetchedData.processed_data.database_save.records_saved} records to databases
-                            </span>
-                          </div>
-                        ) : (
-                          <div className="flex items-center gap-2 text-sm">
-                            <AlertCircle className="h-4 w-4 text-red-600" />
-                            <span className="text-red-700 font-medium">
-                              Auto-save failed - data available for manual download
+                        {/* Main Status Message */}
+                        {dialogState.fetchedData.processed_data.database_save.details?.message && (
+                          <div className={`flex items-center gap-2 text-sm p-2 rounded ${
+                            dialogState.fetchedData.processed_data.database_save.details.status === 'success' 
+                              ? 'bg-green-50 dark:bg-green-950/30 text-green-700 dark:text-green-300'
+                              : dialogState.fetchedData.processed_data.database_save.details.status === 'partial_success'
+                              ? 'bg-yellow-50 dark:bg-yellow-950/30 text-yellow-700 dark:text-yellow-300'
+                              : 'bg-red-50 dark:bg-red-950/30 text-red-700 dark:text-red-300'
+                          }`}>
+                            {dialogState.fetchedData.processed_data.database_save.details.status === 'success' ? (
+                              <CheckCircle className="h-4 w-4 flex-shrink-0" />
+                            ) : (
+                              <AlertCircle className="h-4 w-4 flex-shrink-0" />
+                            )}
+                            <span className="font-medium">
+                              {dialogState.fetchedData.processed_data.database_save.details.message}
                             </span>
                           </div>
                         )}
                         
-                        {/* Database Details */}
-                        {dialogState.fetchedData.processed_data.database_save.success && dialogState.fetchedData.processed_data.database_save.details && (
+                        {/* Database Details Breakdown */}
+                        {dialogState.fetchedData.processed_data.database_save.details?.details && (
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
                             {/* MSSQL Save Result */}
-                            {dialogState.fetchedData.processed_data.database_save.details.mssql_result && (
-                              <div className="flex items-center gap-2 text-xs bg-blue-50 dark:bg-blue-950/20 px-2 py-1 rounded">
-                                <Database className="h-3 w-3 text-blue-600" />
-                                <span className="text-blue-700 dark:text-blue-300">
-                                  MSSQL: {dialogState.fetchedData.processed_data.database_save.details.mssql_result.records_saved || 0} records
-                                </span>
+                            {dialogState.fetchedData.processed_data.database_save.details.details.mssql && (
+                              <div className={`flex flex-col gap-1 text-xs px-3 py-2 rounded border ${
+                                dialogState.fetchedData.processed_data.database_save.details.details.mssql.success
+                                  ? 'bg-blue-50 dark:bg-blue-950/20 border-blue-200 dark:border-blue-800'
+                                  : 'bg-red-50 dark:bg-red-950/20 border-red-200 dark:border-red-800'
+                              }`}>
+                                <div className="flex items-center gap-2 font-medium">
+                                  <Database className="h-3 w-3" />
+                                  <span>MSSQL Database</span>
+                                  {dialogState.fetchedData.processed_data.database_save.details.details.mssql.success ? (
+                                    <CheckCircle className="h-3 w-3 ml-auto text-green-600" />
+                                  ) : (
+                                    <X className="h-3 w-3 ml-auto text-red-600" />
+                                  )}
+                                </div>
+                                <div className="text-muted-foreground">
+                                  {dialogState.fetchedData.processed_data.database_save.details.details.mssql.saved} saved
+                                  {dialogState.fetchedData.processed_data.database_save.details.details.mssql.skipped > 0 && 
+                                    `, ${dialogState.fetchedData.processed_data.database_save.details.details.mssql.skipped} duplicates skipped`
+                                  }
+                                </div>
                               </div>
                             )}
                             
                             {/* Azure Save Result */}
-                            {dialogState.fetchedData.processed_data.database_save.details.azure_result && (
-                              <div className="flex items-center gap-2 text-xs bg-cyan-50 dark:bg-cyan-950/20 px-2 py-1 rounded">
-                                <Database className="h-3 w-3 text-cyan-600" />
-                                <span className="text-cyan-700 dark:text-cyan-300">
-                                  Azure: {dialogState.fetchedData.processed_data.database_save.details.azure_result.records_saved || 0} records
-                                </span>
+                            {dialogState.fetchedData.processed_data.database_save.details.details.azure && (
+                              <div className={`flex flex-col gap-1 text-xs px-3 py-2 rounded border ${
+                                dialogState.fetchedData.processed_data.database_save.details.details.azure.success
+                                  ? 'bg-cyan-50 dark:bg-cyan-950/20 border-cyan-200 dark:border-cyan-800'
+                                  : 'bg-red-50 dark:bg-red-950/20 border-red-200 dark:border-red-800'
+                              }`}>
+                                <div className="flex items-center gap-2 font-medium">
+                                  <Database className="h-3 w-3" />
+                                  <span>Azure Database</span>
+                                  {dialogState.fetchedData.processed_data.database_save.details.details.azure.success ? (
+                                    <CheckCircle className="h-3 w-3 ml-auto text-green-600" />
+                                  ) : (
+                                    <X className="h-3 w-3 ml-auto text-red-600" />
+                                  )}
+                                </div>
+                                <div className="text-muted-foreground">
+                                  {dialogState.fetchedData.processed_data.database_save.details.details.azure.saved} saved
+                                  {dialogState.fetchedData.processed_data.database_save.details.details.azure.skipped > 0 && 
+                                    `, ${dialogState.fetchedData.processed_data.database_save.details.details.azure.skipped} duplicates skipped`
+                                  }
+                                </div>
                               </div>
                             )}
                           </div>
                         )}
                         
-                        {/* Error Details */}
-                        {!dialogState.fetchedData.processed_data.database_save.success && dialogState.fetchedData.processed_data.database_save.details?.error && (
-                          <div className="text-xs text-red-600 bg-red-50 dark:bg-red-950/20 px-2 py-1 rounded">
-                            Error: {dialogState.fetchedData.processed_data.database_save.details.error}
-                          </div>
+                        {/* Legacy fallback for old response format */}
+                        {!dialogState.fetchedData.processed_data.database_save.details?.message && (
+                          <>
+                            {dialogState.fetchedData.processed_data.database_save.success ? (
+                              <div className="flex items-center gap-2 text-sm">
+                                <CheckCircle className="h-4 w-4 text-green-600" />
+                                <span className="text-green-700 font-medium">
+                                  Auto-saved {dialogState.fetchedData.processed_data.database_save.records_saved} records to databases
+                                </span>
+                              </div>
+                            ) : (
+                              <div className="flex items-center gap-2 text-sm">
+                                <AlertCircle className="h-4 w-4 text-red-600" />
+                                <span className="text-red-700 font-medium">
+                                  Auto-save failed - data available for manual download
+                                </span>
+                              </div>
+                            )}
+                          </>
                         )}
                       </div>
                     </div>

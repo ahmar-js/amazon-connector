@@ -1,9 +1,5 @@
 from django.shortcuts import render
 from django.http import JsonResponse, HttpResponse
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from rest_framework.permissions import AllowAny
 import requests
 import logging
 from django.conf import settings
@@ -1150,6 +1146,126 @@ class FetchAmazonDataView(View):
         self.last_token_refresh_time = 0
         self.token_refresh_cooldown = 30  # Seconds to wait before allowing another refresh
     
+    def check_existing_orders_in_daterange(self, marketplace_id: str, start_date: str, end_date: str) -> Dict:
+        """
+        Check for existing orders in the database within the specified date range.
+        This provides fast deduplication by querying the database before making API calls.
+        
+        Args:
+            marketplace_id (str): Amazon marketplace ID
+            start_date (str): Start date in ISO format
+            end_date (str): End date in ISO format
+            
+        Returns:
+            Dict: Contains existing order IDs and statistics
+        """
+        try:
+            from .simple_db_save import create_mssql_connection, create_Azure_db_connection
+            from sqlalchemy import text
+            
+            # Marketplace to table mapping
+            MARKETPLACE_TABLE_MAPPING = {
+                'A1PA6795UKMFR9': 'amazon_api_de_test',  # Germany
+                'A1RKKUPIHCS9HS': 'amazon_api_es_test',  # Spain
+                'APJ6JRA9NG5V4': 'amazon_api_it_test',   # Italy
+                'A1F83G8C2ARO7P': 'amazon_api_uk_test',  # United Kingdom
+                'ATVPDKIKX0DER': 'amazon_api_usa',  # United States
+                'A2EUQ1WTGCTBG2': 'amazon_api_ca',  # Canada
+                'A13V1IB3VIYZZH': 'amazon_api_fr_test',  # France
+            }
+            
+            table_name = MARKETPLACE_TABLE_MAPPING.get(marketplace_id)
+            if not table_name:
+                logger.warning(f"No table mapping for marketplace {marketplace_id}, skipping duplicate check")
+                return {'success': True, 'existing_order_ids': set(), 'total_existing': 0}
+            
+            # Convert ISO date strings to datetime for comparison
+            start_dt = datetime.fromisoformat(start_date.replace('Z', ''))
+            end_dt = datetime.fromisoformat(end_date.replace('Z', ''))
+            
+            logger.info(f"🔍 Checking for existing orders in {table_name} between {start_dt} and {end_dt}")
+            
+            # Query MSSQL database for existing order IDs
+            existing_order_ids = set()
+            
+            try:
+                engine = create_mssql_connection()
+                
+                # Use PurchaseDate_conversion for date filtering (it's a datetime column)
+                # AmazonOrderId is the unique identifier for orders
+                query = text(f"""
+                    SELECT DISTINCT AmazonOrderId
+                    FROM {table_name}
+                    WHERE PurchaseDate_conversion >= :start_date 
+                    AND PurchaseDate_conversion <= :end_date
+                """)
+                
+                with engine.connect() as conn:
+                    result = conn.execute(
+                        query,
+                        {"start_date": start_dt, "end_date": end_dt}
+                    )
+                    existing_order_ids = {row[0] for row in result if row[0]}
+                
+                logger.info(f"✅ Found {len(existing_order_ids)} existing orders in {table_name}")
+                
+                if existing_order_ids:
+                    logger.info(f"📋 Sample existing order IDs: {list(existing_order_ids)[:5]}")
+                
+                return {
+                    'success': True,
+                    'existing_order_ids': existing_order_ids,
+                    'total_existing': len(existing_order_ids),
+                    'table_checked': table_name
+                }
+                
+            except Exception as db_error:
+                logger.error(f"❌ Database query failed: {db_error}", exc_info=True)
+                # Return empty set on error to allow fetch to proceed
+                return {
+                    'success': False,
+                    'existing_order_ids': set(),
+                    'total_existing': 0,
+                    'error': str(db_error)
+                }
+                
+        except Exception as e:
+            logger.error(f"❌ Error checking existing orders: {e}", exc_info=True)
+            return {
+                'success': False,
+                'existing_order_ids': set(),
+                'total_existing': 0,
+                'error': str(e)
+            }
+    
+    def filter_new_orders(self, orders: List[Dict], existing_order_ids: set) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Filter orders to separate new orders from already-existing ones.
+        
+        Args:
+            orders (List[Dict]): List of orders fetched from Amazon API
+            existing_order_ids (set): Set of order IDs that already exist in database
+            
+        Returns:
+            Tuple[List[Dict], List[Dict]]: (new_orders, duplicate_orders)
+        """
+        if not existing_order_ids:
+            return orders, []
+        
+        new_orders = []
+        duplicate_orders = []
+        
+        for order in orders:
+            order_id = order.get('AmazonOrderId')
+            if order_id in existing_order_ids:
+                duplicate_orders.append(order)
+            else:
+                new_orders.append(order)
+        
+        logger.info(f"📊 Order filtering results: {len(new_orders)} new, {len(duplicate_orders)} duplicates")
+        
+        return new_orders, duplicate_orders
+    
     def post(self, request, *args, **kwargs):
         """
         Handle POST requests to fetch Amazon data.
@@ -1312,14 +1428,33 @@ class FetchAmazonDataView(View):
             
             # Start fetching data
             fetch_start_time = time.time()
-            logger.info("I am here")
+            logger.info("🚀 Starting Amazon data fetch with deduplication check...")
+            
+            # Step 1: Check for existing orders in database (DEDUPLICATION)
+            duplicate_check = self.check_existing_orders_in_daterange(
+                marketplace_id, 
+                start_date, 
+                end_date
+            )
+            
+            existing_order_ids = duplicate_check.get('existing_order_ids', set())
+            total_existing = duplicate_check.get('total_existing', 0)
+            
+            if total_existing > 0:
+                logger.info(f"⚠️  Found {total_existing} existing orders in database for this date range")
+                logger.info(f"✅ Will skip fetching items for existing orders to save API quota")
+            else:
+                logger.info(f"✅ No existing orders found - will fetch all data")
+            
+            # Step 2: Fetch orders from Amazon API
             result = self.fetch_orders_with_items(
                 headers, 
                 base_url,
                 marketplace_id, 
                 start_date, 
                 end_date, 
-                max_orders
+                max_orders,
+                existing_order_ids=existing_order_ids  # Pass existing IDs for filtering
             )
             
             fetch_duration = time.time() - fetch_start_time
@@ -1467,10 +1602,40 @@ class FetchAmazonDataView(View):
                             'records_saved': 0
                         }
                     
+                    # Add deduplication information to response
+                    deduplication_info = result.get('deduplication', {})
+                    new_count = deduplication_info.get('new_orders', 0)
+                    dup_count = deduplication_info.get('duplicate_orders', 0)
+                    total_from_api = deduplication_info.get('total_orders_fetched_from_api', total_orders)
+                    
+                    # Create user-friendly deduplication message
+                    if dup_count > 0 and new_count > 0:
+                        dedup_message = f"✓ Found {new_count} new orders (skipped {dup_count} duplicates already in database)"
+                        dedup_status = "partial_duplicates"
+                    elif dup_count > 0 and new_count == 0:
+                        dedup_message = f"✓ All {dup_count} orders already exist in database - no duplicates created"
+                        dedup_status = "all_duplicates"
+                    elif new_count > 0 and dup_count == 0:
+                        dedup_message = f"✓ All {new_count} orders are new - saved successfully"
+                        dedup_status = "all_new"
+                    else:
+                        dedup_message = "✓ No orders to process"
+                        dedup_status = "empty"
+                    
                     response_data = {
                         'orders': orders,
                         'order_items': order_items,
                         'processed_data': processed_data_info,
+                        'deduplication': {
+                            'enabled': True,
+                            'status': dedup_status,
+                            'total_orders_from_api': total_from_api,
+                            'new_orders': new_count,
+                            'duplicate_orders_skipped': dup_count,
+                            'api_calls_saved': deduplication_info.get('api_calls_saved', 0),
+                            'message': dedup_message,
+                            'summary': f"{new_count} new, {dup_count} skipped"
+                        },
                         'metadata': {
                             'total_orders_fetched': total_orders,
                             'total_items_fetched': total_items,
@@ -1529,8 +1694,23 @@ class FetchAmazonDataView(View):
                         activity.items_fetched = total_items
                         activity.duration_seconds = total_duration
                         
-                        # Create detailed message including database save info
-                        detail_message = f'Successfully fetched {total_orders} orders and {total_items} items in {total_duration:.1f}s'
+                        # Create detailed message including deduplication and database save info
+                        detail_parts = []
+                        
+                        # Fetch summary with deduplication
+                        if 'deduplication_info' in locals() and deduplication_info:
+                            new_count = deduplication_info.get('new_orders', 0)
+                            dup_count = deduplication_info.get('duplicate_orders', 0)
+                            if dup_count > 0:
+                                detail_parts.append(f'Fetched {total_orders} orders ({new_count} new, {dup_count} duplicates skipped)')
+                            else:
+                                detail_parts.append(f'Fetched {total_orders} orders (all new)')
+                        else:
+                            detail_parts.append(f'Fetched {total_orders} orders')
+                        
+                        detail_parts.append(f'{total_items} items in {total_duration:.1f}s')
+                        
+                        # Database save info
                         if auto_save and db_save_result:
                             # Update separate database save status fields
                             activity.mssql_saved = db_save_result.get('mssql_success', False)
@@ -1539,19 +1719,29 @@ class FetchAmazonDataView(View):
                             
                             if db_save_result['success']:
                                 # At least one database save succeeded
-                                detail_message += f' | Auto-saved {db_save_result["total_records_saved"]} records to databases'
+                                saved_count = db_save_result["total_records_saved"]
+                                db_details = db_save_result.get('details', {})
+                                mssql_info = db_details.get('mssql', {})
+                                azure_info = db_details.get('azure', {})
+                                
+                                if mssql_info.get('skipped', 0) > 0 or azure_info.get('skipped', 0) > 0:
+                                    detail_parts.append(f'Saved {saved_count} new records')
+                                    detail_parts.append(f'(MSSQL: {mssql_info.get("saved", 0)} saved, {mssql_info.get("skipped", 0)} dups')
+                                    detail_parts.append(f'Azure: {azure_info.get("saved", 0)} saved, {azure_info.get("skipped", 0)} dups)')
+                                else:
+                                    detail_parts.append(f'Saved {saved_count} records')
+                                
                                 if activity.mssql_saved and activity.azure_saved:
-                                    detail_message += ' (MSSQL: ✓, Azure: ✓)'
+                                    detail_parts.append('✓ Both DBs')
                                 elif activity.mssql_saved:
-                                    detail_message += ' (MSSQL: ✓, Azure: ✗)'
+                                    detail_parts.append('✓ MSSQL only')
                                 elif activity.azure_saved:
-                                    detail_message += ' (MSSQL: ✗, Azure: ✓)'
+                                    detail_parts.append('✓ Azure only')
                             else:
                                 # Both database saves failed
-                                detail_message += f' | Auto-save failed: {db_save_result.get("error", "Unknown error")}'
-                                detail_message += ' (MSSQL: ✗, Azure: ✗)'
+                                detail_parts.append('✗ Auto-save failed')
                         elif auto_save:
-                            detail_message += ' | Auto-save was attempted but no save result available'
+                            detail_parts.append('⚠ Auto-save attempted (no result)')
                             activity.database_saved = False
                             activity.mssql_saved = False
                             activity.azure_saved = False
@@ -1559,6 +1749,8 @@ class FetchAmazonDataView(View):
                             activity.database_saved = False
                             activity.mssql_saved = False
                             activity.azure_saved = False
+                        
+                        detail_message = ' | '.join(detail_parts)
                         
                         activity.detail = detail_message
                         activity.save()
@@ -1653,15 +1845,17 @@ class FetchAmazonDataView(View):
         marketplace_id: str, 
         start_date: str, 
         end_date: str, 
-        max_orders: Union[int, float]
+        max_orders: Union[int, float],
+        existing_order_ids: set = None
     ) -> Dict:
         """
         Main orchestration method for fetching orders and their items.
         
         This method coordinates the entire data fetching process:
         1. Fetches all orders within the date range
-        2. Fetches items for each order
-        3. Structures the data for the response
+        2. Filters out existing orders (deduplication)
+        3. Fetches items only for new orders
+        4. Structures the data for the response
         
         Args:
             headers (Dict[str, str]): Request headers including access token
@@ -1670,22 +1864,29 @@ class FetchAmazonDataView(View):
             start_date (str): Start date in ISO format
             end_date (str): End date in ISO format
             max_orders (Union[int, float]): Maximum number of orders to fetch (float('inf') for unlimited)
+            existing_order_ids (set): Set of order IDs that already exist in database
             
         Returns:
             Dict: Contains orders, items, and summary information
         """
         try:
+            if existing_order_ids is None:
+                existing_order_ids = set()
+            
+            logger.info(f"📋 Starting fetch_orders_with_items with {len(existing_order_ids)} existing orders to filter")
+            
             # Step 1: Fetch all orders with pagination
-            logger.info("Step 1: Fetching orders...")
+            logger.info("Step 1: Fetching orders from Amazon API...")
             orders_result = self.fetch_all_orders(headers, base_url, marketplace_id, start_date, end_date, max_orders)
             
             if not orders_result['success']:
                 return orders_result
             
-            orders = orders_result['orders']
-            logger.info(f"Fetched {len(orders)} orders")
+            all_orders = orders_result['orders']
+            total_fetched = len(all_orders)
+            logger.info(f"✅ Fetched {total_fetched} orders from Amazon API")
             
-            if not orders:
+            if not all_orders:
                 return {
                     'success': True,
                     'data': {
@@ -1699,27 +1900,63 @@ class FetchAmazonDataView(View):
                     'summary': {
                         'total_orders': 0,
                         'total_items': 0
+                    },
+                    'deduplication': {
+                        'total_orders_fetched': 0,
+                        'new_orders': 0,
+                        'duplicate_orders': 0,
+                        'duplicate_order_ids': [],
+                        'items_fetched_for_new_only': True,
+                        'api_calls_saved': 0
                     }
                 }
             
-            # Step 2: Fetch items for all orders
-            logger.info("Step 2: Fetching order items...")
-            items_result = self.fetch_order_items_batch(headers, base_url, orders)
+            # Step 2: Filter out existing orders (DEDUPLICATION)
+            logger.info("Step 2: Filtering out duplicate orders...")
+            new_orders, duplicate_orders = self.filter_new_orders(all_orders, existing_order_ids)
             
-            if not items_result['success']:
-                return items_result
+            logger.info(f"📊 Deduplication results: {len(new_orders)} new orders, {len(duplicate_orders)} duplicates")
             
-            # Step 3: Structure the data
-            logger.info("Step 3: Structuring data...")
-            structured_data = self.structure_order_data(orders, items_result['items'])
+            # Step 3: Fetch items ONLY for new orders (saves API quota!)
+            if new_orders:
+                logger.info(f"Step 3: Fetching items for {len(new_orders)} new orders...")
+                items_result = self.fetch_order_items_batch(headers, base_url, new_orders)
+                
+                if not items_result['success']:
+                    return items_result
+                
+                order_items = items_result['items']
+                failed_orders = items_result.get('failed_orders', [])
+            else:
+                logger.info(f"ℹ️  No new orders to fetch items for (all are duplicates)")
+                order_items = {}
+                failed_orders = []
+            
+            # Step 4: Structure the response (ONLY include orders with items fetched)
+            logger.info("Step 4: Structuring data...")
+            structured_data = self.structure_order_data(all_orders, order_items)
+            
+            total_items = sum(len(items) for items in order_items.values())
+            orders_with_items = len(structured_data.get('orders', []))  # Only orders with items
+            
+            logger.info(f"📦 Structured data: {orders_with_items} orders with items (filtered out {len(duplicate_orders)} duplicates)")
             
             return {
                 'success': True,
                 'data': structured_data,
                 'summary': {
-                    'total_orders': len(orders),
-                    'total_items': sum(len(items) for items in items_result['items'].values()),
-                    'failed_orders': items_result.get('failed_orders', [])
+                    'total_orders': orders_with_items,  # Only count orders with items
+                    'total_items': total_items,
+                    'failed_orders': failed_orders
+                },
+                'deduplication': {
+                    'total_orders_fetched_from_api': total_fetched,
+                    'new_orders': len(new_orders),
+                    'duplicate_orders': len(duplicate_orders),
+                    'duplicate_order_ids': [order.get('AmazonOrderId') for order in duplicate_orders],
+                    'orders_included_in_response': orders_with_items,
+                    'items_fetched_for_new_only': True,
+                    'api_calls_saved': len(duplicate_orders)  # Each duplicate order = 1 saved API call
                 }
             }
             
@@ -2875,6 +3112,8 @@ class FetchAmazonDataView(View):
         - All raw item details from Amazon API
         - Metadata and summary information
         
+        CRITICAL: Only includes orders that have items fetched (prevents duplicate records)
+        
         Args:
             orders (List[Dict]): List of orders from the API
             order_items (Dict[str, List[Dict]]): Dictionary of order items by order ID
@@ -2890,6 +3129,11 @@ class FetchAmazonDataView(View):
             
             # Get items for this order
             items = order_items.get(order_id, []) if order_id else []
+            
+            # CRITICAL FIX: Only include orders that have items fetched
+            # This prevents processing and saving orders without complete data
+            if not items:
+                continue  # Skip orders without items (they're duplicates we didn't fetch items for)
             
             # Use all raw order data without mapping
             structured_order = dict(order)  # Copy all fields from original order

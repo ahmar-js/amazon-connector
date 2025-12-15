@@ -23,7 +23,9 @@ import {
   Shield,
   Settings,
   RefreshCw,
-  Pause
+  Pause,
+  ShoppingCart,
+  Package
 } from "lucide-react"
 import { type Activity } from "@/lib/api"
 
@@ -281,10 +283,82 @@ export function ActivityDetailsModal({ isOpen, onClose, activity, loading }: Act
                 </div>
               )}
               
+              {/* Activity Details - Parse and display enhanced format */}
               <div>
                 <strong>Details:</strong>
                 <div className="mt-2 p-3 bg-gray-100 dark:bg-gray-800 rounded">
-                  <p className="text-sm whitespace-pre-wrap">{activity.detail || 'No details available'}</p>
+                  {activity.detail && (() => {
+                    // Try to parse enhanced detail format
+                    const detailStr = activity.detail;
+                    
+                    // Check if it contains the new pipe-separated format
+                    if (detailStr.includes('|') && (detailStr.includes('duplicates skipped') || detailStr.includes('all new'))) {
+                      const parts = detailStr.split('|').map(p => p.trim());
+                      return (
+                        <div className="space-y-2">
+                          {parts.map((part, idx) => {
+                            // Parse different sections
+                            if (part.includes('Fetched') && part.includes('orders')) {
+                              // Extract order info with deduplication
+                              const match = part.match(/Fetched (\d+) orders \((.+?)\)/);
+                              if (match) {
+                                return (
+                                  <div key={idx} className="flex items-center gap-2 text-sm">
+                                    <ShoppingCart className="h-4 w-4 text-blue-600" />
+                                    <span>
+                                      <strong>{match[1]} orders</strong>
+                                      <span className="text-muted-foreground ml-2">({match[2]})</span>
+                                    </span>
+                                  </div>
+                                );
+                              }
+                            } else if (part.includes('items in')) {
+                              // Extract items and duration
+                              const match = part.match(/(\d+) items in ([\d.]+)s/);
+                              if (match) {
+                                return (
+                                  <div key={idx} className="flex items-center gap-2 text-sm">
+                                    <Package className="h-4 w-4 text-purple-600" />
+                                    <span><strong>{match[1]} items</strong></span>
+                                    <Clock className="h-4 w-4 text-orange-600 ml-2" />
+                                    <span className="text-muted-foreground">{match[2]}s</span>
+                                  </div>
+                                );
+                              }
+                            } else if (part.includes('Saved') || part.includes('records already exist')) {
+                              // Database save info
+                              return (
+                                <div key={idx} className="flex items-start gap-2 text-sm">
+                                  <Database className="h-4 w-4 text-green-600 mt-0.5" />
+                                  <span className="flex-1">{part}</span>
+                                </div>
+                              );
+                            } else if (part.includes('✓') || part.includes('✗')) {
+                              // Status indicators
+                              return (
+                                <div key={idx} className="flex items-center gap-2 text-sm">
+                                  {part.includes('✓') ? (
+                                    <CheckCircle className="h-4 w-4 text-green-600" />
+                                  ) : (
+                                    <XCircle className="h-4 w-4 text-red-600" />
+                                  )}
+                                  <span className="font-medium">{part}</span>
+                                </div>
+                              );
+                            }
+                            return (
+                              <div key={idx} className="text-sm text-muted-foreground">
+                                {part}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    }
+                    
+                    // Fallback to plain text display
+                    return <p className="text-sm whitespace-pre-wrap">{detailStr || 'No details available'}</p>;
+                  })()}
                 </div>
               </div>
               

@@ -8,9 +8,10 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Form, FormControl, FormDescription, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form"
 import { Badge } from "@/components/ui/badge"
-import { Info, ExternalLink, Key, Shield, RefreshCw, CheckCircle, AlertCircle, ArrowLeft, LogOut, TestTube, Database } from "lucide-react"
+import { Info, ExternalLink, Key, Shield, RefreshCw, CheckCircle, AlertCircle, ArrowLeft, LogOut, TestTube, Database, Wrench } from "lucide-react"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { ManageDataDialog } from "./manage-data-dialog"
+import { RepairDatesDialog } from "./repair-dates-dialog"
 import { AmazonConnectorService, ApiError, type AmazonConnectionRequest } from "@/lib/api"
 
 // Form validation schema
@@ -56,6 +57,11 @@ interface ConnectionState {
   isInitializing?: boolean
   // Data fetching state
   isFetchingData?: boolean
+  // Repair dates state
+  isRepairingDates?: boolean
+  isRepairDialogOpen?: boolean
+  repairSummary?: any
+  repairError?: string
 }
 
 interface AmazonConnectionFormProps {
@@ -346,6 +352,46 @@ export function AmazonConnectionForm({ onDataFetchStart, onDataFetchEnd }: Amazo
     }))
   }
 
+  const handleRepairDates = async () => {
+    try {
+      setConnectionState(prev => ({
+        ...prev,
+        isRepairingDates: true,
+        repairError: undefined,
+        repairSummary: undefined,
+      }))
+
+      const response = await AmazonConnectorService.repairPurchaseDates()
+
+      if (response.success) {
+        setConnectionState(prev => ({
+          ...prev,
+          isRepairingDates: false,
+          isRepairDialogOpen: true,
+          repairSummary: response.data,
+        }))
+      }
+    } catch (error) {
+      console.error('❌ Repair dates error:', error)
+      const errorMessage = error instanceof ApiError ? error.message : 'Failed to repair purchase dates'
+      setConnectionState(prev => ({
+        ...prev,
+        isRepairingDates: false,
+        isRepairDialogOpen: true,
+        repairError: errorMessage,
+      }))
+    }
+  }
+
+  const closeRepairDialog = (open: boolean) => {
+    setConnectionState(prev => ({
+      ...prev,
+      isRepairDialogOpen: open,
+      repairSummary: open ? prev.repairSummary : undefined,
+      repairError: open ? prev.repairError : undefined,
+    }))
+  }
+
   const handleDataFetchStart = () => {
     setConnectionState(prev => ({
       ...prev,
@@ -477,7 +523,7 @@ export function AmazonConnectionForm({ onDataFetchStart, onDataFetchEnd }: Amazo
                       size="sm" 
                       onClick={showConnectForm} 
                       className="cursor-pointer"
-                      disabled={connectionState.isFetchingData}
+                      disabled={connectionState.isFetchingData || connectionState.isRepairingDates}
                     >
                       <RefreshCw className="h-4 w-4 mr-2" />
                       Connect Different Account
@@ -487,10 +533,20 @@ export function AmazonConnectionForm({ onDataFetchStart, onDataFetchEnd }: Amazo
                       size="sm" 
                       onClick={openManageDataDialog} 
                       className="cursor-pointer"
-                      disabled={connectionState.isFetchingData}
+                      disabled={connectionState.isFetchingData || connectionState.isRepairingDates}
                     >
                       <Database className="h-4 w-4 mr-2" />
                       {connectionState.isFetchingData ? 'Fetching Data...' : 'Manage Data'}
+                    </Button>
+                    <Button 
+                      variant="secondary" 
+                      size="sm" 
+                      onClick={handleRepairDates} 
+                      className="cursor-pointer"
+                      disabled={connectionState.isFetchingData || connectionState.isRepairingDates}
+                    >
+                      <Wrench className="h-4 w-4 mr-2" />
+                      {connectionState.isRepairingDates ? 'Repairing...' : 'Repair Dates'}
                     </Button>
                   </div>
                 </div>
@@ -880,6 +936,14 @@ export function AmazonConnectionForm({ onDataFetchStart, onDataFetchEnd }: Amazo
         onOpenChange={closeManageDataDialog}
         onDataFetchStart={handleDataFetchStart}
         onDataFetchEnd={handleDataFetchEnd}
+      />
+
+      {/* Repair Dates Dialog */}
+      <RepairDatesDialog
+        isOpen={connectionState.isRepairDialogOpen || false}
+        onOpenChange={closeRepairDialog}
+        summary={connectionState.repairSummary}
+        error={connectionState.repairError}
       />
     </div>
   )

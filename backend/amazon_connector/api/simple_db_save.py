@@ -117,6 +117,7 @@ def create_Azure_db_connection():
 def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: str) -> Dict:
     """
     Simple database save that relies on pandas to_sql auto-column matching.
+    Includes database-level deduplication to prevent duplicate records.
     """
     
     # Marketplace to table mapping
@@ -142,37 +143,6 @@ def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: 
     }
     
     try:
-        # # Get engines
-        # secondary_conn = connections['secondary']
-        # tertiary_conn = connections['tertiary']
-        
-        # secondary_settings = secondary_conn.settings_dict
-        # tertiary_settings = tertiary_conn.settings_dict
-        
-        # # Create simple connection strings with proper port handling
-        # secondary_port = secondary_settings.get('PORT') or 1433
-        # if isinstance(secondary_port, str) and secondary_port.strip() == '':
-        #     secondary_port = 1433
-        
-        # tertiary_port = tertiary_settings.get('PORT') or 1433
-        # if isinstance(tertiary_port, str) and tertiary_port.strip() == '':
-        #     tertiary_port = 1433
-        
-        # logger.info(f"🔗 Connecting to secondary DB: {secondary_settings['HOST']}:{secondary_port}")
-        # secondary_engine = create_engine(
-        #     f"mssql+pyodbc://{secondary_settings['USER']}:{secondary_settings['PASSWORD']}"
-        #     f"@{secondary_settings['HOST']}:{secondary_port}"
-        #     f"/{secondary_settings['NAME']}?driver=ODBC+Driver+17+for+SQL+Server",
-        #     echo=False
-        # )
-        
-        # logger.info(f"🔗 Connecting to tertiary DB: {tertiary_settings['HOST']}:{tertiary_port}")
-        # tertiary_engine = create_engine(
-        #     f"mssql+pyodbc://{tertiary_settings['USER']}:{tertiary_settings['PASSWORD']}"
-        #     f"@{tertiary_settings['HOST']}:{tertiary_port}"
-        #     f"/{tertiary_settings['NAME']}?driver=ODBC+Driver+17+for+SQL+Server",
-        #     echo=False
-        # )
         MSSQL_engine = create_mssql_connection()
         logging.info(f"MSSQL_engine : {MSSQL_engine}")
     
@@ -181,7 +151,8 @@ def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: 
                 cursor.fast_executemany = True
 
         event.listen(MSSQL_engine, "before_cursor_execute", my_listener)
-        # Save MSSQL DataFrame
+        
+        # Save MSSQL DataFrame with deduplication
         table_name = MARKETPLACE_TABLE_MAPPING.get(marketplace_id)
         if table_name and not mssql_df.empty:
             try:
@@ -191,66 +162,165 @@ def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: 
                 # Clean data
                 df_clean = mssql_df.copy()
                 df_clean['PurchaseDate_conversion'] = pd.to_datetime(df_clean['PurchaseDate_conversion']).dt.strftime('%Y-%m-%d %H:%M:%S')
-                # df_clean = mssql_df.copy().fillna('')
-                print("MSSQLdf_clean columns: ", df_clean.columns)
                 
-                # Convert float columns that should be integers based on your schema
-                integer_columns = [
-                    'NumberOfItemsShipped', 'QuantityShipped', 'QuantityOrdered'
-                ]
+                original_count = len(df_clean)
+                logger.info(f"📊 Original records to save: {original_count}")
                 
-                for col in integer_columns:
-                    if col in df_clean.columns:
-                        # Convert float to int, handling NaN values
-                        df_clean[col] = df_clean[col].fillna(0).astype(float).astype(int)
-                        logger.info(f"🔧 Converted {col} from float to int")
+                # SAFETY CHECK: Verify required columns exist before deduplication
+                if 'AmazonOrderId' not in df_clean.columns or 'OrderItemId' not in df_clean.columns:
+                    logger.error("❌ CRITICAL: Required columns missing for MSSQL deduplication!")
+                    logger.error(f"❌ Expected: AmazonOrderId, OrderItemId")
+                    logger.error(f"❌ Available: {df_clean.columns.tolist()}")
+                    results['mssql_result'] = {
+                        'success': False,
+                        'error': 'Required columns missing - cannot verify duplicates',
+                        'records_saved': 0,
+                        'table_name': table_name
+                    }
+                    results['mssql_success'] = False
+                    results['errors'].append("MSSQL save aborted - required columns missing")
+                    df_clean = pd.DataFrame()  # Clear to prevent unsafe save
                 
-                # Convert float columns that should remain as float but ensure proper format
-                float_columns = [
-                    'PromotionDiscountTax.Amount', 'ShippingTax.Amount', 'ShippingPrice.Amount',
-                    'ShippingDiscount.Amount', 'ShippingDiscountTax.Amount', 'vat',
-                    'item_subtotal', 'promotion', 'Promotional_Tax', 'unit_price(vat_inclusive)',
-                    'vat%', 'calculated_vat', 'unit_price(vat_exclusive)', 'item_total', 'grand_total'
-                ]
+                # DEDUPLICATION: Remove duplicates based on AmazonOrderId + OrderItemId (composite key)
+                if 'AmazonOrderId' in df_clean.columns and 'OrderItemId' in df_clean.columns:
+                    # First, deduplicate within the DataFrame itself
+                    before_dedup = len(df_clean)
+                    df_clean = df_clean.drop_duplicates(subset=['AmazonOrderId', 'OrderItemId'], keep='first')
+                    after_dedup = len(df_clean)
+                    
+                    if before_dedup != after_dedup:
+                        logger.info(f"� Removed {before_dedup - after_dedup} duplicate records within DataFrame")
+                    
+                    # Second, check for existing records in database
+                    from sqlalchemy import text
+                    try:
+                        order_ids = df_clean['AmazonOrderId'].unique().tolist()
+                        
+                        if order_ids:
+                            logger.info(f"🔍 Checking database for {len(order_ids)} orders...")
+                            
+                            # Query database for existing combinations
+                            placeholders = ','.join([f"'{oid}'" for oid in order_ids])
+                            query = text(f"""
+                                SELECT DISTINCT AmazonOrderId, OrderItemId
+                                FROM {table_name}
+                                WHERE AmazonOrderId IN ({placeholders})
+                            """)
+                            
+                            with MSSQL_engine.connect() as conn:
+                                result = conn.execute(query)
+                                existing_combinations = {(row[0], row[1]) for row in result}
+                            
+                            if existing_combinations:
+                                logger.info(f"🔍 Found {len(existing_combinations)} existing order-item combinations in database")
+                                
+                                # Filter out existing combinations
+                                df_clean['_temp_key'] = df_clean.apply(
+                                    lambda row: (row['AmazonOrderId'], row['OrderItemId']), 
+                                    axis=1
+                                )
+                                
+                                before_filter = len(df_clean)
+                                df_clean = df_clean[~df_clean['_temp_key'].isin(existing_combinations)]
+                                df_clean = df_clean.drop(columns=['_temp_key'])
+                                after_filter = len(df_clean)
+                                
+                                filtered_count = before_filter - after_filter
+                                logger.info(f"🔧 Filtered out {filtered_count} duplicate records")
+                                logger.info(f"✅ After database deduplication: {after_filter} new records to save")
+                                
+                                if after_filter == 0:
+                                    logger.info(f"ℹ️  All {original_count} records already exist in database - skipping MSSQL save")
+                                    results['mssql_result'] = {
+                                        'success': True,
+                                        'records_saved': 0,
+                                        'records_skipped': original_count,
+                                        'table_name': table_name,
+                                        'message': 'All records already exist (duplicates skipped)'
+                                    }
+                                    results['mssql_success'] = True
+                                    # Don't return here, continue to Azure save
+                                    df_clean = pd.DataFrame()  # Empty dataframe to skip save below
+                            else:
+                                logger.info(f"✅ No duplicates found - all {len(df_clean)} records are new")
+                                
+                    except Exception as dedup_error:
+                        logger.error(f"❌ CRITICAL: Database deduplication check failed: {dedup_error}", exc_info=True)
+                        logger.error(f"⚠️  ABORTING MSSQL SAVE to prevent duplicates!")
+                        # DO NOT PROCEED - better to fail than insert duplicates
+                        results['mssql_result'] = {
+                            'success': False,
+                            'error': f'Deduplication check failed: {str(dedup_error)}',
+                            'records_saved': 0,
+                            'table_name': table_name
+                        }
+                        results['mssql_success'] = False
+                        results['errors'].append(f"MSSQL save aborted - deduplication check failed: {str(dedup_error)}")
+                        df_clean = pd.DataFrame()  # Empty to skip save below
                 
-                for col in float_columns:
-                    if col in df_clean.columns:
-                        # Ensure proper float format
-                        df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0.0)
-                        logger.info(f"🔧 Ensured {col} is proper float format")
-                
-                # Handle datetime columns - convert datetime objects to strings for nvarchar columns
-                datetime_string_columns = ['PurchaseDate', 'EarliestShipDate', 'LatestShipDate']
-                for col in datetime_string_columns:
-                    if col in df_clean.columns:
-                        # Convert datetime to string format
-                        df_clean[col] = df_clean[col].astype(str)
-                        logger.info(f"🔧 Converted {col} to string format")
-                
-                # Handle PurchaseDate_Materialized as proper date
-                if 'PurchaseDate_Materialized' in df_clean.columns:
-                    df_clean['PurchaseDate_Materialized'] = pd.to_datetime(df_clean['PurchaseDate_Materialized'], errors='coerce')
-                    logger.info("🔧 Converted PurchaseDate_Materialized to proper datetime")
-                
-                # Let pandas handle the column matching automatically with retries
-                _to_sql_with_retries(
-                    df_clean,
-                    engine=MSSQL_engine,
-                    table_name=table_name,
-                    if_exists='append',
-                    index=False,
-                    max_retries=3,
-                    base_backoff=1.0,
-                )
-                
-                results['mssql_result'] = {
-                    'success': True,
-                    'records_saved': len(df_clean),
-                    'table_name': table_name
-                }
-                results['mssql_success'] = True
-                results['total_records_saved'] += len(df_clean)
-                logger.info(f"✅ MSSQL save successful: {len(df_clean)} records")
+                # Only proceed with save if we have records
+                if not df_clean.empty:
+                    print("MSSQLdf_clean columns: ", df_clean.columns)
+                    
+                    # Convert float columns that should be integers based on your schema
+                    integer_columns = [
+                        'NumberOfItemsShipped', 'QuantityShipped', 'QuantityOrdered'
+                    ]
+                    
+                    for col in integer_columns:
+                        if col in df_clean.columns:
+                            # Convert float to int, handling NaN values
+                            df_clean[col] = df_clean[col].fillna(0).astype(float).astype(int)
+                            logger.info(f"🔧 Converted {col} from float to int")
+                    
+                    # Convert float columns that should remain as float but ensure proper format
+                    float_columns = [
+                        'PromotionDiscountTax.Amount', 'ShippingTax.Amount', 'ShippingPrice.Amount',
+                        'ShippingDiscount.Amount', 'ShippingDiscountTax.Amount', 'vat',
+                        'item_subtotal', 'promotion', 'Promotional_Tax', 'unit_price(vat_inclusive)',
+                        'vat%', 'calculated_vat', 'unit_price(vat_exclusive)', 'item_total', 'grand_total'
+                    ]
+                    
+                    for col in float_columns:
+                        if col in df_clean.columns:
+                            # Ensure proper float format
+                            df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0.0)
+                            logger.info(f"🔧 Ensured {col} is proper float format")
+                    
+                    # Handle datetime columns - convert datetime objects to strings for nvarchar columns
+                    datetime_string_columns = ['PurchaseDate', 'EarliestShipDate', 'LatestShipDate']
+                    for col in datetime_string_columns:
+                        if col in df_clean.columns:
+                            # Convert datetime to string format
+                            df_clean[col] = df_clean[col].astype(str)
+                            logger.info(f"🔧 Converted {col} to string format")
+                    
+                    # Handle PurchaseDate_Materialized as proper date
+                    if 'PurchaseDate_Materialized' in df_clean.columns:
+                        df_clean['PurchaseDate_Materialized'] = pd.to_datetime(df_clean['PurchaseDate_Materialized'], errors='coerce')
+                        logger.info("🔧 Converted PurchaseDate_Materialized to proper datetime")
+                    
+                    # Let pandas handle the column matching automatically with retries
+                    _to_sql_with_retries(
+                        df_clean,
+                        engine=MSSQL_engine,
+                        table_name=table_name,
+                        if_exists='append',
+                        index=False,
+                        max_retries=3,
+                        base_backoff=1.0,
+                    )
+                    
+                    results['mssql_result'] = {
+                        'success': True,
+                        'records_saved': len(df_clean),
+                        'records_skipped': original_count - len(df_clean),
+                        'table_name': table_name
+                    }
+                    results['mssql_success'] = True
+                    results['total_records_saved'] += len(df_clean)
+                    logger.info(f"✅ MSSQL save successful: {len(df_clean)} records (skipped {original_count - len(df_clean)} duplicates)")
+                    
             except Exception as mssql_error:
                 logger.error(f"❌ MSSQL save failed: {mssql_error}", exc_info=True)
                 results['mssql_result'] = {
@@ -265,7 +335,7 @@ def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: 
             logger.info("🔄 Skipping MSSQL save - no table mapping or empty DataFrame")
             results['mssql_success'] = False
         
-        # Save Azure DataFrame
+        # Save Azure DataFrame with deduplication
         if not azure_df.empty:
             try:
                 logger.info(f"🔄 Saving Azure data: {len(azure_df)} records to stg_tr_amazon_raw")
@@ -273,70 +343,166 @@ def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: 
                 
                 # Clean data and fix datetime columns
                 df_clean = azure_df.copy()
-                print("Azure df_clean columns: ", df_clean.columns)
-                # Ensure CLEAN_DateTime is datetime64[ns] without timezone
-                if 'CLEAN_DateTime' in df_clean.columns:
-                    df_clean['CLEAN_DateTime'] = pd.to_datetime(df_clean['CLEAN_DateTime'], errors='coerce', utc=False)
-                    # If any tz-aware slipped in, convert to naive
-                    if hasattr(df_clean['CLEAN_DateTime'].dtype, 'tz') and df_clean['CLEAN_DateTime'].dt.tz is not None:
-                        df_clean['CLEAN_DateTime'] = df_clean['CLEAN_DateTime'].dt.tz_convert('UTC').dt.tz_localize(None)
-
-                # Derive Date as date only from CLEAN_DateTime when available, else coerce
-                if 'CLEAN_DateTime' in df_clean.columns:
-                    df_clean['Date'] = pd.to_datetime(df_clean['CLEAN_DateTime'].dt.date, errors='coerce')
-                elif 'Date' in df_clean.columns:
-                    df_clean['Date'] = pd.to_datetime(df_clean['Date'], errors='coerce')
                 
-                # Handle datetime columns that might have invalid formats
-                datetime_columns = ['data_fetch_Date']
+                original_count = len(df_clean)
+                logger.info(f"📊 Original records to save: {original_count}")
                 
-                for col in datetime_columns:
-                    if col in df_clean.columns:
-                        logger.info(f"🔧 Fixing datetime column: {col}")
-                        df_clean[col] = pd.to_datetime(df_clean[col], errors='coerce', utc=False)
-                        # Strip timezone info if present
-                        try:
-                            if hasattr(df_clean[col].dtype, 'tz') and df_clean[col].dt.tz is not None:
-                                df_clean[col] = df_clean[col].dt.tz_convert('UTC').dt.tz_localize(None)
-                        except Exception:
-                            pass
+                # SAFETY CHECK: Verify required columns exist before deduplication
+                if 'OrderId' not in df_clean.columns or 'SKU' not in df_clean.columns:
+                    logger.error("❌ CRITICAL: Required columns missing for Azure deduplication!")
+                    logger.error(f"❌ Expected: OrderId, SKU")
+                    logger.error(f"❌ Available: {df_clean.columns.tolist()}")
+                    results['azure_result'] = {
+                        'success': False,
+                        'error': 'Required columns missing - cannot verify duplicates',
+                        'records_saved': 0,
+                        'table_name': 'stg_tr_amazon_raw'
+                    }
+                    results['azure_success'] = False
+                    results['errors'].append("Azure save aborted - required columns missing")
+                    df_clean = pd.DataFrame()  # Clear to prevent unsafe save
+                
+                # DEDUPLICATION: Remove duplicates based on OrderId + SKU (composite key for Azure)
+                # Azure uses SKU instead of OrderItemId because data is aggregated by SKU
+                if 'OrderId' in df_clean.columns and 'SKU' in df_clean.columns:
+                    # First, deduplicate within the DataFrame itself
+                    before_dedup = len(df_clean)
+                    df_clean = df_clean.drop_duplicates(subset=['OrderId', 'SKU'], keep='first')
+                    after_dedup = len(df_clean)
+                    
+                    if before_dedup != after_dedup:
+                        logger.info(f"🔧 Removed {before_dedup - after_dedup} duplicate records within DataFrame")
+                    
+                    # Second, check for existing records in database
+                    from sqlalchemy import text
+                    try:
+                        order_ids = df_clean['OrderId'].unique().tolist()
                         
+                        if order_ids:
+                            logger.info(f"🔍 Checking Azure database for {len(order_ids)} orders...")
+                            
+                            # Query database for existing combinations (OrderId + SKU)
+                            placeholders = ','.join([f"'{oid}'" for oid in order_ids])
+                            query = text(f"""
+                                SELECT DISTINCT OrderId, SKU
+                                FROM stg_tr_amazon_raw
+                                WHERE OrderId IN ({placeholders})
+                            """)
+                            
+                            engine_AZURE = create_Azure_db_connection()
+                            with engine_AZURE.connect() as conn:
+                                result = conn.execute(query)
+                                existing_combinations = {(row[0], row[1]) for row in result}
+                            
+                            if existing_combinations:
+                                logger.info(f"🔍 Found {len(existing_combinations)} existing order-SKU combinations in Azure database")
+                                
+                                # Filter out existing combinations
+                                df_clean['_temp_key'] = df_clean.apply(
+                                    lambda row: (row['OrderId'], row['SKU']), 
+                                    axis=1
+                                )
+                                
+                                before_filter = len(df_clean)
+                                df_clean = df_clean[~df_clean['_temp_key'].isin(existing_combinations)]
+                                df_clean = df_clean.drop(columns=['_temp_key'])
+                                after_filter = len(df_clean)
+                                
+                                filtered_count = before_filter - after_filter
+                                logger.info(f"🔧 Filtered out {filtered_count} duplicate records")
+                                logger.info(f"✅ After database deduplication: {after_filter} new records to save")
+                                
+                                if after_filter == 0:
+                                    logger.info(f"ℹ️  All {original_count} records already exist in Azure database - skipping save")
+                                    results['azure_result'] = {
+                                        'success': True,
+                                        'records_saved': 0,
+                                        'records_skipped': original_count,
+                                        'table_name': 'stg_tr_amazon_raw',
+                                        'message': 'All records already exist (duplicates skipped)'
+                                    }
+                                    results['azure_success'] = True
+                                    # Don't continue to save, but still mark as successful
+                                    df_clean = pd.DataFrame()  # Empty dataframe
+                            else:
+                                logger.info(f"✅ No duplicates found - all {len(df_clean)} records are new")
+                                
+                    except Exception as dedup_error:
+                        logger.error(f"❌ CRITICAL: Azure database deduplication check failed: {dedup_error}", exc_info=True)
+                        logger.error(f"⚠️  ABORTING AZURE SAVE to prevent duplicates!")
+                        # DO NOT PROCEED - better to fail than insert duplicates
+                        results['azure_result'] = {
+                            'success': False,
+                            'error': f'Deduplication check failed: {str(dedup_error)}',
+                            'records_saved': 0,
+                            'table_name': 'stg_tr_amazon_raw'
+                        }
+                        results['azure_success'] = False
+                        results['errors'].append(f"Azure save aborted - deduplication check failed: {str(dedup_error)}")
+                        df_clean = pd.DataFrame()  # Empty to skip save below
                 
-                # Fill remaining NaN values
-                # df_clean = df_clean.fillna('')
-                
-                engine_AZURE = create_Azure_db_connection()
-                logging.info(f"engine_AZURE : {engine_AZURE}")
-                logging.info(f"{marketplace_id} DATA: {df_clean.shape}")  # -->TABLE
-                
-                def my_listener_2(conn, cursor, statement, parameters, context, executemany):
-                    if executemany:
-                        cursor.fast_executemany = True
+                # Only proceed with save if we have records
+                if not df_clean.empty:
+                    print("Azure df_clean columns: ", df_clean.columns)
+                    
+                    # Ensure CLEAN_DateTime is datetime64[ns] without timezone
+                    if 'CLEAN_DateTime' in df_clean.columns:
+                        df_clean['CLEAN_DateTime'] = pd.to_datetime(df_clean['CLEAN_DateTime'], errors='coerce', utc=False)
+                        # If any tz-aware slipped in, convert to naive
+                        if hasattr(df_clean['CLEAN_DateTime'].dtype, 'tz') and df_clean['CLEAN_DateTime'].dt.tz is not None:
+                            df_clean['CLEAN_DateTime'] = df_clean['CLEAN_DateTime'].dt.tz_convert('UTC').dt.tz_localize(None)
 
-                event.listen(engine_AZURE, "before_cursor_execute", my_listener_2)
+                    # Derive Date as date only from CLEAN_DateTime when available, else coerce
+                    if 'CLEAN_DateTime' in df_clean.columns:
+                        df_clean['Date'] = pd.to_datetime(df_clean['CLEAN_DateTime'].dt.date, errors='coerce')
+                    elif 'Date' in df_clean.columns:
+                        df_clean['Date'] = pd.to_datetime(df_clean['Date'], errors='coerce')
+                    
+                    # Handle datetime columns that might have invalid formats
+                    datetime_columns = ['data_fetch_Date']
+                    
+                    for col in datetime_columns:
+                        if col in df_clean.columns:
+                            logger.info(f"🔧 Fixing datetime column: {col}")
+                            df_clean[col] = pd.to_datetime(df_clean[col], errors='coerce', utc=False)
+                            # Strip timezone info if present
+                            try:
+                                if hasattr(df_clean[col].dtype, 'tz') and df_clean[col].dt.tz is not None:
+                                    df_clean[col] = df_clean[col].dt.tz_convert('UTC').dt.tz_localize(None)
+                            except Exception:
+                                pass
+                    
+                    engine_AZURE = create_Azure_db_connection()
+                    logging.info(f"engine_AZURE : {engine_AZURE}")
+                    logging.info(f"{marketplace_id} DATA: {df_clean.shape}")
+                    
+                    def my_listener_2(conn, cursor, statement, parameters, context, executemany):
+                        if executemany:
+                            cursor.fast_executemany = True
 
-                #merged_df2.to_sql(f"amazon_api_{marketplace_name.lower()}", MSSQL_engine, index=False, if_exists="append")  # append # replace
-                # df_clean.to_sql("stg_tr_amazon_raw", engine_AZURE, index=False, if_exists="append")#append # replace
-                
-                # Let pandas handle the column matching automatically with retries
-                _to_sql_with_retries(
-                    df_clean,
-                    engine=engine_AZURE,
-                    table_name='stg_tr_amazon_raw',
-                    if_exists='append',
-                    index=False,
-                    max_retries=3,
-                    base_backoff=1.0,
-                )
-                
-                results['azure_result'] = {
-                    'success': True,
-                    'records_saved': len(df_clean),
-                    'table_name': 'stg_tr_amazon_raw'
-                }
-                results['azure_success'] = True
-                results['total_records_saved'] += len(df_clean)
-                logger.info(f"✅ Azure save successful: {len(df_clean)} records")
+                    event.listen(engine_AZURE, "before_cursor_execute", my_listener_2)
+                    
+                    # Let pandas handle the column matching automatically with retries
+                    _to_sql_with_retries(
+                        df_clean,
+                        engine=engine_AZURE,
+                        table_name='stg_tr_amazon_raw',
+                        if_exists='append',
+                        index=False,
+                        max_retries=3,
+                        base_backoff=1.0,
+                    )
+                    
+                    results['azure_result'] = {
+                        'success': True,
+                        'records_saved': len(df_clean),
+                        'records_skipped': original_count - len(df_clean),
+                        'table_name': 'stg_tr_amazon_raw'
+                    }
+                    results['azure_success'] = True
+                    results['total_records_saved'] += len(df_clean)
+                    logger.info(f"✅ Azure save successful: {len(df_clean)} records (skipped {original_count - len(df_clean)} duplicates)")
+                    
             except Exception as azure_error:
                 logger.error(f"❌ Azure save failed: {azure_error}", exc_info=True)
                 results['azure_result'] = {
@@ -355,8 +521,53 @@ def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: 
         # Success if at least one database save succeeded
         results['success'] = results['mssql_success'] or results['azure_success']
         
+        # Create user-friendly summary message
+        mssql_saved = results.get('mssql_result', {}).get('records_saved', 0)
+        mssql_skipped = results.get('mssql_result', {}).get('records_skipped', 0)
+        azure_saved = results.get('azure_result', {}).get('records_saved', 0)
+        azure_skipped = results.get('azure_result', {}).get('records_skipped', 0)
+        
+        # Build detailed message
+        message_parts = []
+        if results['mssql_success'] and results['azure_success']:
+            status = "success"
+            message_parts.append(f"✓ Saved {results['total_records_saved']} records to both databases")
+            if mssql_skipped > 0 or azure_skipped > 0:
+                message_parts.append(f"(MSSQL: {mssql_saved} new, {mssql_skipped} duplicates | Azure: {azure_saved} new, {azure_skipped} duplicates)")
+        elif results['mssql_success']:
+            status = "partial_success"
+            message_parts.append(f"✓ Saved {mssql_saved} records to MSSQL")
+            if mssql_skipped > 0:
+                message_parts.append(f"({mssql_skipped} duplicates skipped)")
+            message_parts.append("⚠ Azure save failed")
+        elif results['azure_success']:
+            status = "partial_success"
+            message_parts.append(f"✓ Saved {azure_saved} records to Azure")
+            if azure_skipped > 0:
+                message_parts.append(f"({azure_skipped} duplicates skipped)")
+            message_parts.append("⚠ MSSQL save failed")
+        else:
+            status = "error"
+            message_parts.append("✗ Failed to save to both databases")
+        
+        results['status'] = status
+        results['message'] = " ".join(message_parts)
+        results['details'] = {
+            'mssql': {
+                'saved': mssql_saved,
+                'skipped': mssql_skipped,
+                'success': results['mssql_success']
+            },
+            'azure': {
+                'saved': azure_saved,
+                'skipped': azure_skipped,
+                'success': results['azure_success']
+            }
+        }
+        
         if results['success']:
             logger.info(f"✅ Simple save completed: {results['total_records_saved']} total records")
+            logger.info(f"📊 {results['message']}")
             if results['mssql_success'] and results['azure_success']:
                 logger.info("✅ Both MSSQL and Azure saves succeeded")
             elif results['mssql_success']:
@@ -365,6 +576,7 @@ def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: 
                 logger.info("✅ Azure save succeeded, MSSQL save failed")
         else:
             logger.error("❌ Both MSSQL and Azure saves failed")
+            logger.error(f"📊 {results['message']}")
             
         return results
         
