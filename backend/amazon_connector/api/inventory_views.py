@@ -304,7 +304,8 @@ class FetchInventoryReportView(View):
         )
         return activity
     
-    def update_activity_record(self, activity, status, items_fetched=0, duration_seconds=None, error_message=None):
+    def update_activity_record(self, activity, status, items_fetched=0, duration_seconds=None, error_message=None, 
+                             mssql_saved=False, azure_saved=False, detail_message=None):
         """Update activity record with results"""
         activity.status = status
         activity.items_fetched = items_fetched
@@ -312,6 +313,16 @@ class FetchInventoryReportView(View):
             activity.duration_seconds = duration_seconds
         if error_message:
             activity.error_message = error_message
+        
+        # Update database save status
+        activity.mssql_saved = mssql_saved
+        activity.azure_saved = azure_saved
+        activity.database_saved = mssql_saved or azure_saved
+        
+        # Update detail message if provided
+        if detail_message:
+            activity.detail = detail_message
+        
         activity.save()
     
     def post(self, request):
@@ -406,7 +417,16 @@ class FetchInventoryReportView(View):
                             'message': 'No reports found for yesterday',
                             'activity_id': str(activity.activity_id)
                         }
-                        self.update_activity_record(activity, 'completed', 0, time.time() - start_time)
+                        # Update activity with no database saves since no data to save
+                        self.update_activity_record(
+                            activity=activity,
+                            status='completed',
+                            items_fetched=0,
+                            duration_seconds=time.time() - start_time,
+                            mssql_saved=False,
+                            azure_saved=False,
+                            detail_message='No inventory reports found for yesterday'
+                        )
                         continue
                     
                     # Process the most recent report
@@ -432,7 +452,11 @@ class FetchInventoryReportView(View):
                         download_url, str(file_path)
                     )
                     
-                    # Persist to MSSQL tables
+                    # Initialize save status flags
+                    mssql_saved = False
+                    azure_saved = False
+                    
+                    # Persist to MSSQL database
                     try:
                         mssql_save = save_inventory_report_to_mssql(
                             csv_path=csv_path,
@@ -440,20 +464,52 @@ class FetchInventoryReportView(View):
                             marketplace_code=marketplace_code,
                             items_count=items_count
                         )
-                        logger.info(f"MSSQL save: {mssql_save}")
+                        logger.info(f"MSSQL save result: {mssql_save}")
+                        mssql_saved = mssql_save.get('success', False)
+                    except Exception as mssql_err:
+                        logger.error(f"MSSQL save failed for {marketplace_code}: {mssql_err}")
+                        mssql_save = {
+                            'success': False,
+                            'error': str(mssql_err)
+                        }
+                        mssql_saved = False
+                    
+                    # Persist to Azure database
+                    try:
                         azure_save = save_inventory_report_to_azure(
                             csv_path=csv_path,
                             latest_report=latest_report,
                             marketplace_code=marketplace_code,
                             items_count=items_count
                         )
-                        logger.info(f"Azure save: {azure_save}")
-                    except Exception as db_err:
-                        logger.error(f"MSSQL save failed for {marketplace_code}: {db_err}")
-                        mssql_save = {
+                        logger.info(f"Azure save result: {azure_save}")
+                        azure_saved = azure_save.get('success', False)
+                    except Exception as azure_err:
+                        logger.error(f"Azure save failed for {marketplace_code}: {azure_err}")
+                        azure_save = {
                             'success': False,
-                            'error': str(db_err)
+                            'error': str(azure_err)
                         }
+                        azure_saved = False
+                    
+                    # Build detail message including database save status
+                    detail_parts = []
+                    detail_parts.append(f'Fetched {items_count} items')
+                    
+                    if mssql_saved and azure_saved:
+                        detail_parts.append('✓ Both DBs')
+                        db_status = 'Both databases saved successfully'
+                    elif mssql_saved:
+                        detail_parts.append('✓ MSSQL only')
+                        db_status = 'MSSQL saved, Azure failed'
+                    elif azure_saved:
+                        detail_parts.append('✓ Azure only')
+                        db_status = 'Azure saved, MSSQL failed'
+                    else:
+                        detail_parts.append('✗ DB save failed')
+                        db_status = 'Both database saves failed'
+                    
+                    detail_message = ' | '.join(detail_parts)
                     
                     total_reports_found += 1
                     total_items_processed += items_count
@@ -467,13 +523,24 @@ class FetchInventoryReportView(View):
                         'file_path': csv_path,
                         'created_time': latest_report['createdTime'],
                         'activity_id': str(activity.activity_id),
-                        'mssql_save': mssql_save
+                        'mssql_save': mssql_save,
+                        'azure_save': azure_save,
+                        'database_status': db_status
                     }
                     
-                    # Update activity record
-                    self.update_activity_record(activity, 'completed', items_count, time.time() - start_time)
+                    # Update activity record with database save status
+                    self.update_activity_record(
+                        activity=activity,
+                        status='completed',
+                        items_fetched=items_count,
+                        duration_seconds=time.time() - start_time,
+                        mssql_saved=mssql_saved,
+                        azure_saved=azure_saved,
+                        detail_message=detail_message
+                    )
                     
                     logger.info(f"Successfully processed inventory report for {marketplace_code}")
+                    logger.info(f"Database save status - MSSQL: {mssql_saved}, Azure: {azure_saved}")
                     
                 except Exception as e:
                     logger.error(f"Error processing {marketplace_code}: {e}")
@@ -482,7 +549,17 @@ class FetchInventoryReportView(View):
                         'error': str(e),
                         'activity_id': str(activity.activity_id)
                     }
-                    self.update_activity_record(activity, 'failed', 0, time.time() - start_time, str(e))
+                    # Update activity record with failed status and no database saves
+                    self.update_activity_record(
+                        activity=activity,
+                        status='failed',
+                        items_fetched=0,
+                        duration_seconds=time.time() - start_time,
+                        error_message=str(e),
+                        mssql_saved=False,
+                        azure_saved=False,
+                        detail_message=f'Failed to process inventory report: {str(e)}'
+                    )
             
             return JsonResponse({
                 'success': True,

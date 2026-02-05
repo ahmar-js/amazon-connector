@@ -122,10 +122,10 @@ def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: 
     
     # Marketplace to table mapping
     MARKETPLACE_TABLE_MAPPING = {
-        'A1PA6795UKMFR9': 'amazon_api_de_test',  # Germany
-        'A1RKKUPIHCS9HS': 'amazon_api_es_test',  # Spain
-        'APJ6JRA9NG5V4': 'amazon_api_it_test',   # Italy
-        'A1F83G8C2ARO7P': 'amazon_api_uk_test',  # United Kingdom
+        'A1PA6795UKMFR9': 'amazon_api_de',  # Germany
+        'A1RKKUPIHCS9HS': 'amazon_api_es',  # Spain
+        'APJ6JRA9NG5V4': 'amazon_api_it',   # Italy
+        'A1F83G8C2ARO7P': 'amazon_api_uk',  # United Kingdom
         'ATVPDKIKX0DER': 'amazon_api_usa',  # United States
         'A2EUQ1WTGCTBG2': 'amazon_api_ca',  # Canada
         'A13V1IB3VIYZZH': 'amazon_api_fr_test',  # France

@@ -963,6 +963,61 @@ class FetchAmazonDataView(View):
     ORDERS_MAX_REQUESTS_PER_SECOND = 0.0167  # 1 request every 60 seconds
     ORDER_ITEMS_MAX_REQUESTS_PER_SECOND = 0.5  # 1 request every 2 seconds
 
+    # Marketplace-specific rate limits based on credential approval status
+    # USA/CA have production-approved credentials with full rate limits
+    # European marketplaces appear to have restricted/sandbox credentials with lower limits
+    MARKETPLACE_RATE_LIMITS = {
+        # North America - Production approved (full limits)
+        "ATVPDKIKX0DER": {
+            "items_per_second": 0.5,    # 1 request every 2 seconds
+            "items_burst": 30,           # Full burst capacity
+            "orders_per_second": 0.0167, # 1 request every 60 seconds
+            "orders_burst": 20
+        },
+        "A2EUQ1WTGCTBG2": {
+            "items_per_second": 0.5,
+            "items_burst": 30,
+            "orders_per_second": 0.0167,
+            "orders_burst": 20
+        },
+        
+        # Europe - Restricted/Sandbox (reduced limits to avoid throttling)
+        "A1F83G8C2ARO7P": {  # UK
+            "items_per_second": 0.3,    # 0.2 - 1 request every 5 seconds (conservative)
+            "items_burst": 15,           # Reduced burst
+            "orders_per_second": 0.0167,
+            "orders_burst": 12
+        },
+        "A1PA6795UKMFR9": {  # Germany
+            "items_per_second": 0.4,
+            "items_burst": 20,
+            "orders_per_second": 0.0167,
+            "orders_burst": 15
+        },
+        "APJ6JRA9NG5V4": {   # Italy
+            "items_per_second": 0.4,
+            "items_burst": 20,
+            "orders_per_second": 0.0167,
+            "orders_burst": 15
+        },
+        "A1RKKUPIHCS9HS": {  # Spain
+            "items_per_second": 0.4,
+            "items_burst": 20,
+            "orders_per_second": 0.0167,
+            "orders_burst": 15
+        },
+    }
+    
+    # Default/fallback rate limits for unknown marketplaces (conservative)
+    DEFAULT_RATE_LIMITS = {
+        "items_per_second": 0.2,
+        "items_burst": 10,
+        "orders_per_second": 0.0167,
+        "orders_burst": 10
+    }
+    
+    # Official Amazon SP-API rate limits (defaults - can be overridden per marketplace)
+
     # Official burst limits from Amazon documentation
     ORDERS_BURST_LIMIT = 20
     ORDER_ITEMS_BURST_LIMIT = 30
@@ -979,7 +1034,7 @@ class FetchAmazonDataView(View):
     # Enhanced retry parameters (more conservative)
     MAX_RETRIES = 3  # Reduced from 5 to prevent excessive retries
     BASE_RETRY_DELAY = 5  # Increased base delay (was 2)
-    MAX_RETRY_DELAY = 400  # Increased max delay (6 minutes 40 seconds, was 10 minutes)
+    MAX_RETRY_DELAY = 600  # Increased max delay (10 minutes, was 5)
     JITTER_RANGE = 0.2  # Increased jitter (±20%, was ±10%)
 
     # Timeout for API requests in seconds (fail faster; outer retries handle backoff)
@@ -1119,16 +1174,48 @@ class FetchAmazonDataView(View):
             'Accept': 'application/json',
             'Content-Type': 'application/json'
         })
+                # Initialize marketplace-specific rate limiters
+        # Each marketplace gets its own rate limiter based on credential approval status
+        self.marketplace_rate_limiters = {}
         
-        # Initialize enhanced rate limiters with official Amazon limits
+        for marketplace_id, limits in self.MARKETPLACE_RATE_LIMITS.items():
+            self.marketplace_rate_limiters[marketplace_id] = {
+                'orders': self.EnhancedTokenBucketRateLimiter(
+                    limits['orders_per_second'],
+                    limits['orders_burst']
+                ),
+                'items': self.EnhancedTokenBucketRateLimiter(
+                    limits['items_per_second'],
+                    limits['items_burst']
+                )
+            }
+            logger.info(
+                f"🎯 Initialized rate limiters for {marketplace_id}: "
+                f"Items={limits['items_per_second']}/s (burst={limits['items_burst']}), "
+                f"Orders={limits['orders_per_second']}/s (burst={limits['orders_burst']})"
+            )
+        
+        # Initialize default rate limiters for unknown marketplaces (fallback)
         self.orders_rate_limiter = self.EnhancedTokenBucketRateLimiter(
-            self.ORDERS_MAX_REQUESTS_PER_SECOND, 
-            self.ORDERS_BURST_LIMIT
+            self.DEFAULT_RATE_LIMITS['orders_per_second'], 
+            self.DEFAULT_RATE_LIMITS['orders_burst']
         )
         self.order_items_rate_limiter = self.EnhancedTokenBucketRateLimiter(
-            self.ORDER_ITEMS_MAX_REQUESTS_PER_SECOND, 
-            self.ORDER_ITEMS_BURST_LIMIT
+            self.DEFAULT_RATE_LIMITS['items_per_second'], 
+            self.DEFAULT_RATE_LIMITS['items_burst']
         )
+        
+        # Store current marketplace_id for rate limiter selection
+        self.current_marketplace_id = None
+        # Initialize enhanced rate limiters with official Amazon limits
+        # self.orders_rate_limiter = self.EnhancedTokenBucketRateLimiter(
+        #     self.ORDERS_MAX_REQUESTS_PER_SECOND, 
+        #     self.ORDERS_BURST_LIMIT
+        # )
+        # self.order_items_rate_limiter = self.EnhancedTokenBucketRateLimiter(
+        #     self.ORDER_ITEMS_MAX_REQUESTS_PER_SECOND, 
+        #     self.ORDER_ITEMS_BURST_LIMIT
+        # )
         
         # Initialize circuit breaker
         self.circuit_breaker = self.CircuitBreaker(
@@ -1165,10 +1252,10 @@ class FetchAmazonDataView(View):
             
             # Marketplace to table mapping
             MARKETPLACE_TABLE_MAPPING = {
-                'A1PA6795UKMFR9': 'amazon_api_de_test',  # Germany
-                'A1RKKUPIHCS9HS': 'amazon_api_es_test',  # Spain
-                'APJ6JRA9NG5V4': 'amazon_api_it_test',   # Italy
-                'A1F83G8C2ARO7P': 'amazon_api_uk_test',  # United Kingdom
+                'A1PA6795UKMFR9': 'amazon_api_de',  # Germany
+                'A1RKKUPIHCS9HS': 'amazon_api_es',  # Spain
+                'APJ6JRA9NG5V4': 'amazon_api_it',   # Italy
+                'A1F83G8C2ARO7P': 'amazon_api_uk',  # United Kingdom
                 'ATVPDKIKX0DER': 'amazon_api_usa',  # United States
                 'A2EUQ1WTGCTBG2': 'amazon_api_ca',  # Canada
                 'A13V1IB3VIYZZH': 'amazon_api_fr_test',  # France
@@ -2684,7 +2771,7 @@ class FetchAmazonDataView(View):
         allow_token_refresh: bool = True
     ) -> requests.Response:
         """
-        Enhanced rate-limited request with automatic token refresh and better error handling.
+        Enhanced rate-limited request with automatic token refresh and better error handling & maretplace specific rate limiting.
         
         Args:
             method (str): HTTP method
@@ -2700,11 +2787,23 @@ class FetchAmazonDataView(View):
         """
         # Apply rate limiting with priority
         priority = "high" if is_order_items else "normal"
-        
-        if is_order_items:
-            self.order_items_rate_limiter.acquire(priority)
+                # Use marketplace-specific rate limiter if marketplace is set
+        if self.current_marketplace_id and self.current_marketplace_id in self.marketplace_rate_limiters:
+            limiters = self.marketplace_rate_limiters[self.current_marketplace_id]
+            if is_order_items:
+                limiters['items'].acquire(priority)
+            else:
+                limiters['orders'].acquire(priority)
         else:
-            self.orders_rate_limiter.acquire(priority)
+            # Fallback to default rate limiters
+            if is_order_items:
+                self.order_items_rate_limiter.acquire(priority)
+            else:
+                self.orders_rate_limiter.acquire(priority)
+        # if is_order_items:
+        #     self.order_items_rate_limiter.acquire(priority)
+        # else:
+        #     self.orders_rate_limiter.acquire(priority)
         
         try:
             response = self.session.request(
