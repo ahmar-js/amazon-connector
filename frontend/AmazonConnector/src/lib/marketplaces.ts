@@ -60,7 +60,7 @@ export const MARKETPLACES: Record<string, Marketplace> = {
     code: 'ES',
     id: 'A1RKKUPIHCS9HS',
     region: 'eu',
-    disabled: true,
+    disabled: false,
     name: 'Spain'
   }
 };

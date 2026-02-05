@@ -127,3 +127,5 @@ last_run.json
 *.csv
 inventory.py
 processed_data/
+
+marketplaces_creds.py
