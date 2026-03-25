@@ -1258,7 +1258,7 @@ class FetchAmazonDataView(View):
                 'A1F83G8C2ARO7P': 'amazon_api_uk',  # United Kingdom
                 'ATVPDKIKX0DER': 'amazon_api_usa',  # United States
                 'A2EUQ1WTGCTBG2': 'amazon_api_ca',  # Canada
-                'A13V1IB3VIYZZH': 'amazon_api_fr_test',  # France
+                'A13V1IB3VIYZZH': 'amazon_api_fr',  # France
             }
             
             table_name = MARKETPLACE_TABLE_MAPPING.get(marketplace_id)
