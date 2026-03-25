@@ -16,7 +16,6 @@ from .marketplaces_creds import (
     COMPANY_MARKETPLACE_CREDENTIAL_MAP,
     DEFAULT_COMPANY_NAME,
     MARKETPLACE_CREDENTIAL_MAP,
-    get_company_marketplace_pairs,
     get_credentials_for_marketplace,
     get_credential_group_for_marketplace,
 )
@@ -283,13 +282,6 @@ def process_marketplaces(self):
     - Stops when all marketplaces have reached END_DATE
     """
     try:
-        # Ensure tracking rows exist for all configured company/marketplace pairs.
-        for company_name, marketplace_id in get_company_marketplace_pairs():
-            MarketplaceLastRun.objects.get_or_create(
-                company_name=company_name,
-                marketplace_id=marketplace_id,
-            )
-
         # Pull all marketplaces; we'll choose the one whose next-day window is earliest
         # (round-robin by day across marketplaces). Ties are broken deterministically by marketplace_id.
         records = list(MarketplaceLastRun.objects.all())
@@ -894,13 +886,6 @@ def process_scm_marketplaces(self):
     - End: Current date - 1 (yesterday)
     """
     try:
-        # Ensure SCM rows exist for all configured company/marketplace pairs.
-        for company_name, marketplace_id in get_company_marketplace_pairs():
-            SCMLastRun.objects.get_or_create(
-                company_name=company_name,
-                marketplace_id=marketplace_id,
-            )
-        
         records = list(SCMLastRun.objects.all())
         if not records:
             logger.info("[process_scm_marketplaces] No SCM marketplaces found. Re-queuing in 60s.")
