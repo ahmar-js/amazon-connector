@@ -3,6 +3,20 @@ from django.core.validators import MinValueValidator
 from django.utils import timezone
 import uuid
 
+MARKETPLACE_NAME_MAP = {
+    'ATVPDKIKX0DER': 'United States',
+    'A2EUQ1WTGCTBG2': 'Canada',
+    'A1F83G8C2ARO7P': 'United Kingdom',
+    'A1PA6795UKMFR9': 'Germany',
+    'A13V1IB3VIYZZH': 'France',
+    'APJ6JRA9NG5V4': 'Italy',
+    'A1RKKUPIHCS9HS': 'Spain',
+}
+
+
+def resolve_marketplace_name(marketplace_id: str) -> str:
+    return MARKETPLACE_NAME_MAP.get(marketplace_id, marketplace_id)
+
 # Create your models here.
 class Activities(models.Model):
     ACTIVITY_TYPE_CHOICES = [
@@ -37,6 +51,12 @@ class Activities(models.Model):
     marketplace_id = models.CharField(
         max_length=255,
         help_text="Amazon marketplace ID (e.g., ATVPDKIKX0DER for US)"
+    )
+
+    marketplace_name = models.CharField(
+        max_length=100,
+        default='',
+        help_text="Human-readable marketplace name derived from marketplace_id"
     )
 
     company_name = models.CharField(
@@ -162,19 +182,9 @@ class Activities(models.Model):
     def __str__(self):
         return f'{self.get_activity_type_display()} - {self.marketplace_id} ({self.status})'
     
-    @property
-    def marketplace_name(self):
-        """Get human-readable marketplace name"""
-        marketplace_map = {
-            'ATVPDKIKX0DER': 'United States',
-            'A2EUQ1WTGCTBG2': 'Canada',
-            'A1F83G8C2ARO7P': 'United Kingdom',
-            'A1PA6795UKMFR9': 'Germany',
-            'A13V1IB3VIYZZH': 'France',
-            'APJ6JRA9NG5V4': 'Italy',
-            'A1RKKUPIHCS9HS': 'Spain',
-        }
-        return marketplace_map.get(self.marketplace_id, self.marketplace_id)
+    def save(self, *args, **kwargs):
+        self.marketplace_name = resolve_marketplace_name(self.marketplace_id)
+        super().save(*args, **kwargs)
     
     @property
     def duration_formatted(self):
@@ -205,6 +215,11 @@ class MarketplaceLastRun(models.Model):
         help_text="Company/account name used for this marketplace tracking row"
     )
     marketplace_id = models.CharField(max_length=255)
+    marketplace_name = models.CharField(
+        max_length=100,
+        default='',
+        help_text="Human-readable marketplace name derived from marketplace_id"
+    )
     last_run = models.DateTimeField(auto_now_add=True)
     
     class Meta:
@@ -221,6 +236,10 @@ class MarketplaceLastRun(models.Model):
     def __str__(self):
         return f"{self.company_name} - {self.marketplace_id}"
 
+    def save(self, *args, **kwargs):
+        self.marketplace_name = resolve_marketplace_name(self.marketplace_id)
+        super().save(*args, **kwargs)
+
 
 class SCMLastRun(models.Model):
     """Model to track the last run time for SCM data fetching per marketplace"""
@@ -232,6 +251,11 @@ class SCMLastRun(models.Model):
     marketplace_id = models.CharField(
         max_length=255,
         help_text="Amazon marketplace ID (e.g., ATVPDKIKX0DER for US)"
+    )
+    marketplace_name = models.CharField(
+        max_length=100,
+        default='',
+        help_text="Human-readable marketplace name derived from marketplace_id"
     )
     last_run = models.DateTimeField(
         null=True, 
@@ -254,3 +278,7 @@ class SCMLastRun(models.Model):
     
     def __str__(self):
         return f"SCM {self.company_name} {self.marketplace_id} - Last run: {self.last_run}"
+
+    def save(self, *args, **kwargs):
+        self.marketplace_name = resolve_marketplace_name(self.marketplace_id)
+        super().save(*args, **kwargs)
