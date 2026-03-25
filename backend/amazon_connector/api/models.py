@@ -38,6 +38,12 @@ class Activities(models.Model):
         max_length=255,
         help_text="Amazon marketplace ID (e.g., ATVPDKIKX0DER for US)"
     )
+
+    company_name = models.CharField(
+        max_length=100,
+        default='B2Fitinss',
+        help_text="Company/account name used for this fetch (e.g., B2Fitinss, RDX INC LTD)"
+    )
     
     # Activity classification
     activity_type = models.CharField(
@@ -140,13 +146,14 @@ class Activities(models.Model):
         ordering = ['-activity_date']
         indexes = [
             models.Index(fields=['marketplace_id', '-activity_date']),
+            models.Index(fields=['company_name', '-activity_date']),
             models.Index(fields=['activity_type', '-activity_date']),
             models.Index(fields=['status', '-activity_date']),
         ]
         # Add unique constraint to prevent duplicate fetch operations
         constraints = [
             models.UniqueConstraint(
-                fields=['marketplace_id', 'activity_type', 'date_from', 'date_to', 'status'],
+                fields=['company_name', 'marketplace_id', 'activity_type', 'date_from', 'date_to', 'status'],
                 condition=models.Q(status='in_progress'),
                 name='unique_in_progress_activity'
             )
@@ -192,6 +199,11 @@ class Activities(models.Model):
 
 class MarketplaceLastRun(models.Model):
     """Model to track the last run time for each marketplace"""
+    company_name = models.CharField(
+        max_length=100,
+        default='B2Fitinss',
+        help_text="Company/account name used for this marketplace tracking row"
+    )
     marketplace_id = models.CharField(max_length=255)
     last_run = models.DateTimeField(auto_now_add=True)
     
@@ -199,13 +211,26 @@ class MarketplaceLastRun(models.Model):
         db_table = 'marketplace_last_run'
         verbose_name = 'Marketplace Last Run'
         verbose_name_plural = 'Marketplace Last Runs'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['company_name', 'marketplace_id'],
+                name='unique_marketplace_company_last_run'
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.company_name} - {self.marketplace_id}"
 
 
 class SCMLastRun(models.Model):
     """Model to track the last run time for SCM data fetching per marketplace"""
+    company_name = models.CharField(
+        max_length=100,
+        default='B2Fitinss',
+        help_text="Company/account name used for this SCM tracking row"
+    )
     marketplace_id = models.CharField(
-        max_length=255, 
-        unique=True,
+        max_length=255,
         help_text="Amazon marketplace ID (e.g., ATVPDKIKX0DER for US)"
     )
     last_run = models.DateTimeField(
@@ -220,6 +245,12 @@ class SCMLastRun(models.Model):
         db_table = 'scm_last_run'
         verbose_name = 'SCM Last Run'
         verbose_name_plural = 'SCM Last Runs'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['company_name', 'marketplace_id'],
+                name='unique_scm_marketplace_company_last_run'
+            )
+        ]
     
     def __str__(self):
-        return f"SCM {self.marketplace_id} - Last run: {self.last_run}"
+        return f"SCM {self.company_name} {self.marketplace_id} - Last run: {self.last_run}"

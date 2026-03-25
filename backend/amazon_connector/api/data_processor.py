@@ -46,11 +46,33 @@ class AmazonDataProcessor:
         'Amazon.fr': {'region': 'FR', 'country': 'France', 'company': 'RDXINC LTD '},
     }
     
-    def __init__(self):
+    def __init__(self, company_name: Optional[str] = None):
         """Initialize the processor with optimized pandas settings."""
         # Optimize pandas for performance
         pd.set_option('mode.copy_on_write', True)
+        self.company_name = company_name.strip() if company_name else None
         logger.info("Amazon Data Processor initialized")
+
+    def _resolve_company_for_channel(self, sales_channel: str, fallback_company: str) -> str:
+        """
+        Resolve the output company label for a marketplace channel.
+
+        Rules:
+        - If no company_name is provided, keep legacy mapping from MARKETPLACE_REGIONS.
+        - For old account (B2Fitinss), keep US/CA as brandsinn and ES as B2fitness LTD.
+        - Otherwise, use the provided company_name for all mapped channels.
+        """
+        if not self.company_name:
+            return fallback_company
+
+        if self.company_name == 'B2Fitinss':
+            if sales_channel in ('Amazon.com', 'Amazon.ca'):
+                return 'brandsinn'
+            if sales_channel == 'Amazon.es':
+                return 'B2fitness LTD'
+            return 'B2Fitinss'
+
+        return self.company_name
 
     def last_sunday_of_march(self, year):
         # Get the last day of March for the given year
@@ -625,7 +647,7 @@ class AmazonDataProcessor:
             mask = df['SalesChannel'] == marketplace
             df.loc[mask, 'Region'] = info['region']
             df.loc[mask, 'Country'] = info['country']
-            df.loc[mask, 'Company'] = info['company']
+            df.loc[mask, 'Company'] = self._resolve_company_for_channel(marketplace, info['company'])
         
         return df
     
@@ -823,7 +845,7 @@ class AmazonDataProcessor:
         # Update Company and Country based on marketplace
         for marketplace, info in self.MARKETPLACE_REGIONS.items():
             mask = df['SalesChannel'] == marketplace
-            df.loc[mask, 'Company'] = info['company']
+            df.loc[mask, 'Company'] = self._resolve_company_for_channel(marketplace, info['company'])
             df.loc[mask, 'Country'] = info['country']
         
         return df
@@ -1044,8 +1066,12 @@ class AmazonDataProcessor:
             raise
 
 
-def process_amazon_data(orders_data: List[Dict], order_items_data: List[Dict], 
-                       marketplace_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def process_amazon_data(
+    orders_data: List[Dict],
+    order_items_data: List[Dict],
+    marketplace_name: str,
+    company_name: Optional[str] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Main entry point for Amazon data processing.
     
@@ -1057,7 +1083,7 @@ def process_amazon_data(orders_data: List[Dict], order_items_data: List[Dict],
     Returns:
         Tuple of (mssql_df, azure_df) processed DataFrames
     """
-    processor = AmazonDataProcessor()
+    processor = AmazonDataProcessor(company_name=company_name)
     return processor.process_data(orders_data, order_items_data, marketplace_name) 
 
 

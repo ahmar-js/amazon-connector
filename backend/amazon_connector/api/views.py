@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import pandas as pd
 from .data_processor import process_amazon_data
+from .marketplaces_creds import DEFAULT_COMPANY_NAME
 from .models import Activities
 from .simple_db_save import save_simple, save_scm_data
 from django.core.paginator import Paginator
@@ -1314,11 +1315,13 @@ class FetchAmazonDataView(View):
             max_orders = data.get('max_orders')
             auto_save = data.get('auto_save', False)  # Get auto_save parameter
             data_type = data.get('data_type', None)  # Get data_type parameter for SCM
+            company_name = (data.get('company_name') or DEFAULT_COMPANY_NAME).strip()
             logger.info(f"🔍 Start date: {start_date}, End date: {end_date}")
             logger.info(f"🔍 data_type: {data_type}")
+            logger.info(f"🔍 company_name: {company_name}")
             
             # Debug logging
-            logger.info(f"🔍 Request parameters: marketplace_id={marketplace_id}, auto_save={auto_save}, data_type={data_type}")
+            logger.info(f"🔍 Request parameters: company_name={company_name}, marketplace_id={marketplace_id}, auto_save={auto_save}, data_type={data_type}")
             logger.info(f"🔍 Full request data keys: {list(data.keys())}")
             
             # If max_orders is None or null, fetch all orders (no limit)
@@ -1384,6 +1387,7 @@ class FetchAmazonDataView(View):
             try:
                 # Try to get existing in-progress activity first, then create if needed
                 activity, created = Activities.objects.get_or_create(
+                    company_name=company_name,
                     marketplace_id=marketplace_id,
                     activity_type='orders',
                     date_from=start_dt.date(),
@@ -1391,7 +1395,7 @@ class FetchAmazonDataView(View):
                     status='in_progress',
                     defaults={
                         'action': 'manual',
-                        'detail': f'Starting data fetch for {marketplace_id} from {start_dt.date()} to {end_dt.date()}'
+                        'detail': f'Starting data fetch for {company_name}/{marketplace_id} from {start_dt.date()} to {end_dt.date()}'
                     }
                 )
                 
@@ -1400,7 +1404,7 @@ class FetchAmazonDataView(View):
                 else:
                     logger.info(f"Found existing in-progress activity: {activity.activity_id}")
                     # Update the detail to show it's continuing
-                    activity.detail = f'Continuing data fetch for {marketplace_id} from {start_dt.date()} to {end_dt.date()}'
+                    activity.detail = f'Continuing data fetch for {company_name}/{marketplace_id} from {start_dt.date()} to {end_dt.date()}'
                     activity.save()
                     
             except Exception as activity_error:
@@ -1503,7 +1507,7 @@ class FetchAmazonDataView(View):
                     logger.info(f"🔄 Starting data processing for {marketplace_name}...")
                     
                     # Process the data
-                    mssql_df, azure_df = process_amazon_data(orders, order_items, marketplace_name)
+                    mssql_df, azure_df = process_amazon_data(orders, order_items, marketplace_name, company_name)
                     print("azure_df length: ", len(azure_df))
                     
                     processing_duration = time.time() - processing_start_time
@@ -1583,6 +1587,7 @@ class FetchAmazonDataView(View):
                         'azure_data': azure_data,
                         'marketplace_name': marketplace_name,
                         'marketplace_id': marketplace_id,
+                        'company_name': company_name,
                         'created_at': datetime.now().isoformat(),
                         'date_range': {
                             'start_date': start_date,
@@ -1654,6 +1659,7 @@ class FetchAmazonDataView(View):
                             'total_orders_fetched': total_orders,
                             'total_items_fetched': total_items,
                             'marketplace_id': marketplace_id,
+                            'company_name': company_name,
                             'marketplace_name': marketplace_names.get(marketplace_id, f'Marketplace {marketplace_id}'),
                             'date_range': {
                                 'start_date': start_date,
@@ -1682,6 +1688,7 @@ class FetchAmazonDataView(View):
                             'total_orders_fetched': total_orders,
                             'total_items_fetched': total_items,
                             'marketplace_id': marketplace_id,
+                            'company_name': company_name,
                             'marketplace_name': marketplace_names.get(marketplace_id, f'Marketplace {marketplace_id}'),
                             'date_range': {
                                 'start_date': start_date,
@@ -4051,11 +4058,13 @@ class FetchMissingOrdersView(View):
             marketplace_id = data['marketplace_id'].strip()
             order_ids = data['order_ids']
             auto_save = data.get('auto_save', True)  # Default to True
+            company_name = (data.get('company_name') or DEFAULT_COMPANY_NAME).strip()
             
             logger.info(f"🔑 Access token length: {len(access_token)}")
             logger.info(f"🌍 Marketplace ID: {marketplace_id}")
             logger.info(f"📦 Number of order IDs: {len(order_ids)}")
             logger.info(f"💾 Auto-save enabled: {auto_save}")
+            logger.info(f"🏢 Company: {company_name}")
             logger.info(f"📋 Order IDs: {order_ids}")
             
             # Validate order_ids
@@ -4116,7 +4125,7 @@ class FetchMissingOrdersView(View):
             logger.info(f"✅ Headers configured")
             
             logger.info(f"\n{'='*80}")
-            logger.info(f"🎯 SUMMARY: Fetching {len(order_ids)} missing orders for {marketplace_name}")
+            logger.info(f"🎯 SUMMARY: Fetching {len(order_ids)} missing orders for {company_name}/{marketplace_name}")
             logger.info(f"{'='*80}\n")
             
             # Create activity record
@@ -4124,6 +4133,7 @@ class FetchMissingOrdersView(View):
             activity = None
             try:
                 activity = Activities.objects.create(
+                    company_name=company_name,
                     marketplace_id=marketplace_id,
                     activity_type='fetch_missing_orders',
                     status='in_progress',
@@ -4218,7 +4228,7 @@ class FetchMissingOrdersView(View):
                     logger.info(f"   Items to process: {len(all_order_items)}")
                     
                     # Process the data using the same processor as main fetch
-                    mssql_df, azure_df = process_amazon_data(orders, all_order_items, marketplace_name)
+                    mssql_df, azure_df = process_amazon_data(orders, all_order_items, marketplace_name, company_name)
                     
                     processing_duration = time.time() - processing_start_time
                     logger.info(f"✅ Data processing completed in {processing_duration:.2f}s")
