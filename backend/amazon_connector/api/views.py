@@ -19,7 +19,7 @@ import threading
 import pandas as pd
 from .data_processor import process_amazon_data
 from .models import Activities
-from .simple_db_save import save_simple
+from .simple_db_save import save_simple, save_scm_data
 from django.core.paginator import Paginator
 from django.db.models import Q
 import random
@@ -1162,17 +1162,17 @@ class FetchAmazonDataView(View):
         try:
             from .simple_db_save import create_mssql_connection, create_Azure_db_connection
             from sqlalchemy import text
-            
+
             # Marketplace to table mapping
             MARKETPLACE_TABLE_MAPPING = {
-                'A1PA6795UKMFR9': 'amazon_api_de_test',  # Germany
-                'A1RKKUPIHCS9HS': 'amazon_api_es_test',  # Spain
-                'APJ6JRA9NG5V4': 'amazon_api_it_test',   # Italy
-                'A1F83G8C2ARO7P': 'amazon_api_uk_test',  # United Kingdom
-                'ATVPDKIKX0DER': 'amazon_api_usa',  # United States
-                'A2EUQ1WTGCTBG2': 'amazon_api_ca',  # Canada
-                'A13V1IB3VIYZZH': 'amazon_api_fr_test',  # France
-            }
+                    'A1PA6795UKMFR9': 'amazon_api_de',  # Germany
+                    'A1RKKUPIHCS9HS': 'amazon_api_es',  # Spain
+                    'APJ6JRA9NG5V4': 'amazon_api_it',   # Italy
+                    'A1F83G8C2ARO7P': 'amazon_api_uk',  # United Kingdom
+                    'ATVPDKIKX0DER': 'amazon_api_usa',  # United States
+                    'A2EUQ1WTGCTBG2': 'amazon_api_ca',  # Canada
+                    'A13V1IB3VIYZZH': 'amazon_api_fr',  # France
+                }
             
             table_name = MARKETPLACE_TABLE_MAPPING.get(marketplace_id)
             if not table_name:
@@ -1279,7 +1279,7 @@ class FetchAmazonDataView(View):
         - start_date: ISO format date string (YYYY-MM-DDTHH:MM:SSZ)
         - end_date: ISO format date string (YYYY-MM-DDTHH:MM:SSZ)
         - max_orders: Optional maximum number of orders to fetch (default: unlimited)
-        
+        - auto_save: Optional boolean to auto-save fetched data (default: False)
         Returns:
             JsonResponse: Contains the fetched data or error information
         """
@@ -1313,10 +1313,12 @@ class FetchAmazonDataView(View):
             end_date = data['end_date'].strip()
             max_orders = data.get('max_orders')
             auto_save = data.get('auto_save', False)  # Get auto_save parameter
+            data_type = data.get('data_type', None)  # Get data_type parameter for SCM
             logger.info(f"🔍 Start date: {start_date}, End date: {end_date}")
+            logger.info(f"🔍 data_type: {data_type}")
             
             # Debug logging
-            logger.info(f"🔍 Request parameters: marketplace_id={marketplace_id}, auto_save={auto_save}")
+            logger.info(f"🔍 Request parameters: marketplace_id={marketplace_id}, auto_save={auto_save}, data_type={data_type}")
             logger.info(f"🔍 Full request data keys: {list(data.keys())}")
             
             # If max_orders is None or null, fetch all orders (no limit)
@@ -1430,12 +1432,16 @@ class FetchAmazonDataView(View):
             fetch_start_time = time.time()
             logger.info("🚀 Starting Amazon data fetch with deduplication check...")
             
-            # Step 1: Check for existing orders in database (DEDUPLICATION)
-            duplicate_check = self.check_existing_orders_in_daterange(
-                marketplace_id, 
-                start_date, 
-                end_date
-            )
+            if data_type == 'scm_data':
+                duplicate_check = {'existing_order_ids': set(), 'total_existing': 0}
+                logger.info("📦 SCM data type detected - skipping duplicate check")
+            else:
+                # Step 1: Check for existing orders in database (DEDUPLICATION)
+                duplicate_check = self.check_existing_orders_in_daterange(
+                    marketplace_id, 
+                    start_date, 
+                    end_date
+                )
             
             existing_order_ids = duplicate_check.get('existing_order_ids', set())
             total_existing = duplicate_check.get('total_existing', 0)
@@ -1516,8 +1522,16 @@ class FetchAmazonDataView(View):
                         logger.info("🔄 Auto save enabled - saving data to databases...")
                         try:
                             db_save_start_time = time.time()
-                            # Use simple save approach to avoid column alignment issues
-                            db_save_result = save_simple(mssql_df, azure_df, marketplace_id)
+                            
+                            # Use appropriate save function based on data_type
+                            if data_type == 'scm_data':
+                                # SCM-specific save: Only save to SCM tables
+                                logger.info("📦 SCM data type detected - saving to SCM tables only...")
+                                db_save_result = save_scm_data(mssql_df, azure_df, marketplace_id)
+                            else:
+                                # Standard save: Save to amazon_api_* and stg_tr_amazon_raw tables
+                                db_save_result = save_simple(mssql_df, azure_df, marketplace_id)
+                            
                             db_save_duration = time.time() - db_save_start_time
                             
                             if db_save_result['success']:

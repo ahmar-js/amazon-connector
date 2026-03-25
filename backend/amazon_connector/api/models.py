@@ -199,3 +199,27 @@ class MarketplaceLastRun(models.Model):
         db_table = 'marketplace_last_run'
         verbose_name = 'Marketplace Last Run'
         verbose_name_plural = 'Marketplace Last Runs'
+
+
+class SCMLastRun(models.Model):
+    """Model to track the last run time for SCM data fetching per marketplace"""
+    marketplace_id = models.CharField(
+        max_length=255, 
+        unique=True,
+        help_text="Amazon marketplace ID (e.g., ATVPDKIKX0DER for US)"
+    )
+    last_run = models.DateTimeField(
+        null=True, 
+        blank=True,
+        help_text="Last successful fetch date/time for this marketplace"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'scm_last_run'
+        verbose_name = 'SCM Last Run'
+        verbose_name_plural = 'SCM Last Runs'
+    
+    def __str__(self):
+        return f"SCM {self.marketplace_id} - Last run: {self.last_run}"

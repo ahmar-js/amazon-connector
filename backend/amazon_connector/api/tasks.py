@@ -2,9 +2,10 @@
 from datetime import timedelta, datetime, time
 from celery import shared_task
 from celery import group, chain
+from celery.exceptions import Retry
 from django.conf import settings
 import logging
-from .models import MarketplaceLastRun
+from .models import MarketplaceLastRun, SCMLastRun
 from django.utils import timezone
 import os, json
 import requests
@@ -143,72 +144,6 @@ def _within_end_date(start_dt: datetime) -> bool:
     end_day = END_DATE.astimezone(timezone.utc).date()
     return start_day <= end_day
 
-# @shared_task(bind=True, queue='fetching')
-# def fetch_amazon_data(self):
-#     try:
-#         print("Fetching Amazon data...")
-#         logger.info("Fetching Amazon data...")
-
-#         marketplaces = ['APJ6JRA9NG5V4']
-#         access_token = get_access_token()
-#         logger.info(f"access token: {access_token}")
-
-#         for marketplace in marketplaces:
-#             marketplace_last_run = MarketplaceLastRun.objects.get(marketplace_id=marketplace)
-#             # marketplace_last_run, created = MarketplaceLastRun.objects.get_or_create(marketplace_id=marketplace)
-
-#             if marketplace_last_run.last_run is None:
-#                 logger.info("Inside IF statement")
-#                 start_date = "2024-03-04T00:00:00Z"
-#                 end_date = "2024-03-04T23:59:59Z"
-#                 # start_date = (timezone.now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat().replace('+00:00', 'Z')
-#                 # end_date = (timezone.now() - timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=999999).isoformat().replace('+00:00', 'Z')
-#                 logger.info(f"start_date: {start_date}, end_date: {end_date} inside IF Statement")
-#             else:
-#                 logger.info("Inside ELSE statement")
-#                 start_date = "2025-03-04T00:00:00Z"
-#                 end_date = "2025-03-04T23:59:59Z"
-#                 # start_date = marketplace_last_run.last_run.isoformat().replace('+00:00', 'Z')
-#                 # end_date = timezone.now().replace(hour=23, minute=59, second=59, microsecond=999999).isoformat().replace('+00:00', 'Z')
-#                 logger.info(f"start_date: {start_date}, end_date: {end_date} inside ELSE Statement")
-
-#             logger.info(f"Marketplace: {marketplace}, Start: {start_date}, End: {end_date}")
-
-#             payload = {
-#                 "access_token": access_token,
-#                 "marketplace_id": marketplace,
-#                 "start_date": str(start_date),
-#                 "end_date": str(end_date),
-#                 "auto_save": True,
-#             }
-#             # logger.info("payload: ", payload)
-#             logger.info(f"payload: {payload}")
-
-#             # Call your Django API to fetch the data from amazon
-#             response = requests.post("http://127.0.0.1:8000/api/fetch-data/", json=payload)
-
-#             logger.info(f"API Response ({response.status_code})")
-#             # timestamp = timezone.now().strftime('%Y%m%d_%H%M%S')
-#             # filename = f'amazon_response_{marketplace}_{timestamp}.txt'
-#             # file_path = os.path.join(os.path.dirname(__file__), 'responses', filename)
-#             # os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
-#             # with open(file_path, 'w', encoding='utf-8') as f:
-#             #     f.write(response.text)
-
-#             # logger.info(f"Response saved to {file_path}")
-
-#             if response.status_code == 200:
-#                 # Save last run time only if successful
-#                 marketplace_last_run.last_run = timezone.now()
-#                 marketplace_last_run.save()
-#             else:
-#                 logger.warning(f"Failed to fetch data for {marketplace}: {response.status_code}")
-#                 raise Exception(f"Fetch failed with {response.status_code}: {response.text}")
-
-#     except Exception as exc:
-#         logger.error(f"Task failed: {exc}")
-#         raise self.retry(exc=exc, countdown=60, max_retries=3)
 
 
 @shared_task(bind=True, queue='fetching', soft_time_limit=21600, time_limit=21900)
@@ -686,15 +621,352 @@ def generate_reports(self):
         logger.error(f"Report generation task failed: {exc}")
         raise self.retry(exc=exc, countdown=60, max_retries=3)
 
-@shared_task(bind=True, queue='syncing')
-def sync_amazon_data(self, data, **kwargs):
+@shared_task(bind=True, queue='fetching_scm')
+def fetch_scm_data(self):
     """
-    Asynchronous task to sync processed data to databases
+    Fetching task for SCM data - DEPRECATED, use process_scm_marketplaces instead
+    """
+    logger.warning("fetch_scm_data is deprecated. Use process_scm_marketplaces instead.")
+    return {"status": "deprecated", "message": "Use process_scm_marketplaces task"}
+
+
+# ============================================================================
+# SCM DATA FETCH - PER DAY PER MARKETPLACE
+# ============================================================================
+
+# SCM Seed date: Start fetching from Jan 1, 2026
+SCM_SEED_START_LAST_RUN = timezone.datetime(2025, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+
+
+def _scm_day_window_after(last_run: datetime | None) -> tuple[datetime, datetime]:
+    """
+    Given last_run, compute the next day's [start, end] window in UTC for SCM.
+    If last_run is None, use SCM_SEED_START_LAST_RUN and return Jan 1, 2026.
+    Returns (start_dt, end_dt) both aware UTC datetimes.
+    """
+    lr = _parse_last_run(last_run) or SCM_SEED_START_LAST_RUN
+    # Next day
+    next_day_date = (lr.astimezone(timezone.utc).date() + timedelta(days=1))
+    start_dt = timezone.datetime.combine(next_day_date, time(0, 0, 0, tzinfo=timezone.utc))
+    end_dt = timezone.datetime.combine(next_day_date, time(23, 59, 59, tzinfo=timezone.utc))
+    return start_dt, end_dt
+
+
+def _scm_within_end_date(start_dt: datetime) -> bool:
+    """
+    Return True if the day for start_dt is on/before yesterday (current date - 1).
+    """
+    start_day = start_dt.astimezone(timezone.utc).date()
+    # End date is yesterday (current date - 1)
+    yesterday = (timezone.now().astimezone(timezone.utc).date() - timedelta(days=1))
+    return start_day <= yesterday
+
+
+@shared_task(bind=True, queue='fetching_scm', soft_time_limit=21600, time_limit=21900)
+def fetch_scm_for_marketplace(self, marketplace_id: str, start_iso: str, end_iso: str):
+    """
+    Fetch SCM data for a single marketplace for a single day window [start, end].
+    On success, update that marketplace's last_run in SCMLastRun table.
     """
     try:
-        print("Syncing Amazon data...")
-        # Move your database sync logic here
-        pass
-    except Exception as exc:
-        logger.error(f"Sync task failed: {exc}")
+        access_token = get_access_token(marketplace_id)
+        logger.info(f"[fetch_scm_for_marketplace] Obtained access token for {marketplace_id}")
+
+        # Idempotency and sequence guard: only process if this window equals the next required day
+        start_dt = _parse_iso_utc(start_iso)
+        end_dt_req = _parse_iso_utc(end_iso)
+        
+        with transaction.atomic():
+            obj = SCMLastRun.objects.select_for_update().get(marketplace_id=marketplace_id)
+            expected_start_dt, expected_end_dt = _scm_day_window_after(obj.last_run)
+            if start_dt != expected_start_dt:
+                logger.info(
+                    f"[fetch_scm_for_marketplace] Skip {marketplace_id}: requested {start_dt.date()} != expected {expected_start_dt.date()} (idempotent guard)"
+                )
+                return {
+                    "marketplace_id": marketplace_id,
+                    "status": "skipped",
+                    "requested": start_iso,
+                    "expected": expected_start_dt.isoformat().replace("+00:00", "Z"),
+                }
+
+        payload = {
+            "access_token": access_token,
+            "marketplace_id": marketplace_id,
+            "start_date": start_iso,
+            "end_date": end_iso,
+            "auto_save": True,
+            "data_type": "scm_data",  # This triggers SCM processing
+        }
+
+        logger.info(f"[fetch_scm_for_marketplace] {marketplace_id} -> {start_iso} to {end_iso}")
+        response = requests.post(
+            "http://127.0.0.1:8000/api/fetch-data/",
+            json=payload,
+            timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
+        )
+
+        if 200 <= response.status_code < 300:
+            # Parse response to check results
+            response_data = response.json()
+            
+            # Check how many orders were fetched from Amazon
+            metadata = response_data.get('data', {}).get('metadata', {})
+            total_orders_fetched = metadata.get('total_orders_fetched', 0)
+            
+            # Check database save info
+            db_save_info = response_data.get('data', {}).get('processed_data', {}).get('database_save', {})
+            db_save_success = db_save_info.get('success', False)
+            records_saved = db_save_info.get('records_saved', 0)
+            
+            # Case 1: No orders fetched from Amazon (valid - no new orders for this day)
+            # Update last_run and move on
+            if total_orders_fetched == 0:
+                logger.info(
+                    f"[fetch_scm_for_marketplace] No orders for {marketplace_id} on this day. Marking as complete."
+                )
+                end_dt = _parse_iso_utc(end_iso)
+                with transaction.atomic():
+                    obj = SCMLastRun.objects.select_for_update().get(marketplace_id=marketplace_id)
+                    curr_expected_start, _ = _scm_day_window_after(obj.last_run)
+                    if curr_expected_start == start_dt:
+                        obj.last_run = end_dt
+                        obj.save(update_fields=["last_run", "updated_at"])
+                        logger.info(f"[fetch_scm_for_marketplace] Updated SCM last_run for {marketplace_id} -> {end_iso} (no orders)")
+                return {
+                    "marketplace_id": marketplace_id, 
+                    "status": "ok_no_orders", 
+                    "fetched": [start_iso, end_iso], 
+                    "data_type": "scm_data",
+                    "records_saved": 0,
+                    "total_orders_fetched": 0
+                }
+            
+            # Case 2: Orders were fetched but DB save failed - don't update last_run
+            if not db_save_success and records_saved == 0:
+                logger.warning(
+                    f"[fetch_scm_for_marketplace] Data fetch succeeded but DB save failed for {marketplace_id}. "
+                    f"db_save_success={db_save_success}, records_saved={records_saved}. Moving to next marketplace."
+                )
+                return {
+                    "marketplace_id": marketplace_id, 
+                    "status": "db_save_failed", 
+                    "fetched": [start_iso, end_iso], 
+                    "data_type": "scm_data",
+                    "records_saved": records_saved
+                }
+            
+            # Case 3: Orders fetched and saved successfully - update last_run
+            end_dt = _parse_iso_utc(end_iso)
+            with transaction.atomic():
+                obj = SCMLastRun.objects.select_for_update().get(marketplace_id=marketplace_id)
+                curr_expected_start, _ = _scm_day_window_after(obj.last_run)
+                if curr_expected_start != start_dt:
+                    logger.info(
+                        f"[fetch_scm_for_marketplace] Not updating last_run for {marketplace_id}: window already advanced elsewhere"
+                    )
+                else:
+                    obj.last_run = end_dt
+                    obj.save(update_fields=["last_run", "updated_at"])
+            logger.info(f"[fetch_scm_for_marketplace] Updated SCM last_run for {marketplace_id} -> {end_iso} ({records_saved} records saved)")
+            return {"marketplace_id": marketplace_id, "status": "ok", "fetched": [start_iso, end_iso], "data_type": "scm_data", "records_saved": records_saved}
+        else:
+            response_text = response.text[:500]
+            logger.warning(
+                f"[fetch_scm_for_marketplace] Failed for {marketplace_id} ({response.status_code}): {response_text}"
+            )
+            
+            # Check for Amazon's "2 minutes delay" error - retry after 1 hour
+            if response.status_code == 400 and '2 minutes' in response_text.lower():
+                logger.warning(
+                    f"[fetch_scm_for_marketplace] Amazon data delay error for {marketplace_id}. "
+                    f"Data not yet available. Retrying in 1 hour."
+                )
+                raise self.retry(exc=Exception(f"Amazon data delay - HTTP 400"), countdown=3600, max_retries=3)
+            
+            raise Exception(f"HTTP {response.status_code}")
+
+    except requests.exceptions.ConnectionError as exc:
+        retry_count = self.request.retries
+        backoff_delay = min(300, 60 * (2 ** retry_count))
+        logger.warning(
+            f"[fetch_scm_for_marketplace] Connection error for {marketplace_id} (attempt {retry_count + 1}/5). "
+            f"Retrying in {backoff_delay}s"
+        )
+        raise self.retry(exc=exc, countdown=backoff_delay, max_retries=5)
+    except requests.exceptions.Timeout as exc:
+        logger.error(f"[fetch_scm_for_marketplace] Timeout for {marketplace_id}: {exc}")
         raise self.retry(exc=exc, countdown=60, max_retries=3)
+    except Retry:
+        # Re-raise Retry exceptions without catching them in the generic handler
+        raise
+    except Exception as exc:
+        error_str = str(exc).lower()
+        if any(keyword in error_str for keyword in ['rate limit', 'throttl', 'quota', 'too many requests']):
+            retry_count = self.request.retries
+            backoff_delay = min(600, 120 * (2 ** retry_count))
+            logger.warning(
+                f"[fetch_scm_for_marketplace] Rate limit detected for {marketplace_id} (attempt {retry_count + 1}/5). "
+                f"Retrying in {backoff_delay}s"
+            )
+            raise self.retry(exc=exc, countdown=backoff_delay, max_retries=5)
+        
+        logger.error(f"[fetch_scm_for_marketplace] Error for {marketplace_id}: {exc}")
+        raise self.retry(exc=exc, countdown=30, max_retries=5)
+
+
+@shared_task(bind=True, queue='fetching_scm')
+def process_scm_marketplaces(self):
+    """
+    Controller task for SCM data fetching with rate limiting:
+    - Reads all marketplaces and their SCM last_run
+    - Schedules per-marketplace day fetch tasks (one day per marketplace)
+    - Implements rate limiting to avoid Amazon API throttling
+    - Chains itself with appropriate delays based on credential groups
+    - Stops when all marketplaces have reached yesterday's date
+    
+    SCM Date Range:
+    - Start: January 1, 2026
+    - End: Current date - 1 (yesterday)
+    """
+    try:
+        # Get or create SCMLastRun records for all configured marketplaces
+        all_marketplace_ids = list(MARKETPLACE_CREDENTIAL_MAP.keys())
+        
+        # Ensure all marketplaces have SCMLastRun records
+        for mp_id in all_marketplace_ids:
+            SCMLastRun.objects.get_or_create(marketplace_id=mp_id)
+        
+        records = list(SCMLastRun.objects.all())
+        if not records:
+            logger.info("[process_scm_marketplaces] No SCM marketplaces found. Re-queuing in 60s.")
+            self.apply_async(countdown=60)
+            return {"status": "empty"}
+
+        # Pick exactly ONE marketplace for this iteration (strict one-at-a-time processing)
+        candidates = []  # (start_dt, marketplace_id, rec, end_dt, credential_group)
+        for rec in records:
+            start_dt, end_dt = _scm_day_window_after(rec.last_run)
+            eligible = _scm_within_end_date(start_dt)
+            
+            # Get credential group for rate limiting awareness
+            try:
+                cred_group = MARKETPLACE_CREDENTIAL_MAP.get(rec.marketplace_id, "unknown")
+            except:
+                cred_group = "unknown"
+            
+            logger.info(
+                f"[process_scm_marketplaces] Candidate {rec.marketplace_id}: last_run={rec.last_run} -> next_day={start_dt.date()} eligible={eligible} cred_group={cred_group}"
+            )
+            if eligible:
+                candidates.append((start_dt, rec.marketplace_id, rec, end_dt, cred_group))
+
+        if not candidates:
+            # All marketplaces have caught up to yesterday.
+            # Re-queue to check again later (when a new day becomes available).
+            # Check every 4 hours to see if we've crossed into a new day.
+            recheck_delay = 4 * 60 * 60  # 4 hours in seconds
+            logger.info(
+                f"[process_scm_marketplaces] All marketplaces have reached yesterday. "
+                f"Re-queueing to check again in {recheck_delay // 3600} hours."
+            )
+            self.apply_async(countdown=recheck_delay)
+            return {"status": "waiting", "message": "All SCM marketplaces caught up to yesterday. Will recheck later."}
+
+        # Choose the marketplace whose next day is earliest; ties broken by marketplace_id
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        start_dt, _mid, next_rec, end_dt, cred_group = candidates[0]
+        
+        logger.info(
+            f"[process_scm_marketplaces] Chosen next: {next_rec.marketplace_id} for day {start_dt.date()} (earliest among {len(candidates)} candidates) - credential_group={cred_group}"
+        )
+        start_iso = start_dt.isoformat().replace("+00:00", "Z")
+        end_iso = end_dt.isoformat().replace("+00:00", "Z")
+
+        logger.info(
+            f"[process_scm_marketplaces] Scheduling SCM task for {next_rec.marketplace_id}: {start_iso} -> {end_iso}"
+        )
+
+        # Determine delay based on rate limiting strategy
+        next_delay = MARKETPLACE_FETCH_DELAY  # Default delay
+        
+        if len(candidates) > 1:
+            next_candidate_cred_group = candidates[1][4]
+            if next_candidate_cred_group == cred_group:
+                next_delay = SAME_CREDENTIAL_GROUP_DELAY
+                logger.info(
+                    f"[process_scm_marketplaces] Next marketplace shares credential group '{cred_group}', using extended delay: {next_delay}s"
+                )
+            else:
+                logger.info(
+                    f"[process_scm_marketplaces] Next marketplace uses different credential group, using standard delay: {next_delay}s"
+                )
+        
+        # Chain a single marketplace-day fetch, then re-queue the controller with calculated delay
+        ch = chain(
+            fetch_scm_for_marketplace.si(next_rec.marketplace_id, start_iso, end_iso),
+            process_scm_marketplaces.si().set(countdown=next_delay),
+        )
+        ch.apply_async()
+
+        return {
+            "status": "dispatched-one", 
+            "marketplace_id": next_rec.marketplace_id, 
+            "date": start_iso[:10],
+            "next_delay": next_delay,
+            "credential_group": cred_group,
+            "data_type": "scm_data"
+        }
+
+    except Exception as exc:
+        logger.error(f"[process_scm_marketplaces] Controller error: {exc}")
+        raise self.retry(exc=exc, countdown=120, max_retries=10)
+
+
+def get_scm_status() -> dict:
+    """
+    Utility function to get current status of SCM data fetching.
+    Can be called from views or management commands.
+    """
+    records = list(SCMLastRun.objects.all())
+    yesterday = (timezone.now().astimezone(timezone.utc).date() - timedelta(days=1))
+    
+    status_list = []
+    all_caught_up = True
+    
+    for rec in records:
+        next_start, _ = _scm_day_window_after(rec.last_run)
+        is_caught_up = not _scm_within_end_date(next_start)
+        if not is_caught_up:
+            all_caught_up = False
+        
+        status_list.append({
+            "marketplace_id": rec.marketplace_id,
+            "last_run": rec.last_run.isoformat() if rec.last_run else None,
+            "next_day": next_start.date().isoformat(),
+            "is_caught_up": is_caught_up,
+        })
+    
+    return {
+        "marketplaces": status_list,
+        "yesterday": yesterday.isoformat(),
+        "all_caught_up": all_caught_up,
+        "total_marketplaces": len(records),
+    }
+
+
+def reset_scm_progress(marketplace_id: str = None) -> dict:
+    """
+    Reset SCM progress for a specific marketplace or all marketplaces.
+    This sets last_run to None, which will cause fetching to start from Jan 1, 2026.
+    
+    Args:
+        marketplace_id: Specific marketplace to reset, or None for all
+    """
+    if marketplace_id:
+        updated = SCMLastRun.objects.filter(marketplace_id=marketplace_id).update(last_run=None)
+        return {"status": "reset", "marketplace_id": marketplace_id, "updated": updated}
+    else:
+        updated = SCMLastRun.objects.all().update(last_run=None)
+        return {"status": "reset", "message": "All SCM marketplaces reset", "updated": updated}
+

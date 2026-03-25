@@ -114,6 +114,222 @@ def create_Azure_db_connection():
     return create_engine(sqlalchemy_url, 
               echo=False)
 
+
+def save_scm_data(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: str) -> Dict:
+    """
+    Save SCM-specific data to MSSQL tables.
+    
+    1. Creates a subset of mssql_df with specific columns and saves to scm_sku_mapper_* tables
+    2. Creates a subset of azure_df with specific columns and saves to scm_amazon_orders table
+    
+    Args:
+        mssql_df: The merged_df2 DataFrame
+        azure_df: The merged_df3 DataFrame
+        marketplace_id: Amazon marketplace ID
+        
+    Returns:
+        Dict with success status and details
+    """
+    
+    # SCM SKU Mapper table mapping by marketplace
+    SCM_SKU_MAPPER_TABLE_MAPPING = {
+        'A1PA6795UKMFR9': 'scm_sku_mapper_de',  # Germany
+        'A1RKKUPIHCS9HS': 'scm_sku_mapper_es',  # Spain
+        'APJ6JRA9NG5V4': 'scm_sku_mapper_it',   # Italy
+        'A1F83G8C2ARO7P': 'scm_sku_mapper_uk',  # United Kingdom
+        'ATVPDKIKX0DER': 'scm_sku_mapper_usa',  # United States
+        'A2EUQ1WTGCTBG2': 'scm_sku_mapper_ca',  # Canada
+    }
+    
+    # Columns for scm_sku_mapper tables (from mssql_df/merged_df2)
+    SCM_SKU_MAPPER_COLUMNS = [
+        'PurchaseDate',
+        'PurchaseDate_conversion',
+        'AmazonOrderId',
+        'ASIN',
+        'Title',
+        'SalesChannel',
+        'Region',
+        'OrderStatus',
+        'FulfillmentChannel',
+        'SellerSKU',
+        'QuantityOrdered'
+    ]
+    
+    # Columns for scm_amazon_orders table (from azure_df/merged_df3)
+    SCM_AMAZON_ORDERS_COLUMNS = [
+        'CLEAN_DateTime',
+        'Date',
+        'OrderId',
+        'SKU',
+        'Type',
+        'Region',
+        'Quantity',
+        'FulfillmentChannel'
+    ]
+    
+    results = {
+        'success': True,
+        'scm_sku_mapper_result': None,
+        'scm_amazon_orders_result': None,
+        'total_records_saved': 0,
+        'errors': []
+    }
+    
+    try:
+        MSSQL_engine = create_mssql_connection()
+        logger.info(f"SCM MSSQL engine created: {MSSQL_engine}")
+        
+        def my_listener(conn, cursor, statement, parameters, context, executemany):
+            if executemany:
+                cursor.fast_executemany = True
+        
+        event.listen(MSSQL_engine, "before_cursor_execute", my_listener)
+        
+        # 1. Save mssql_df subset to scm_sku_mapper_* table
+        sku_mapper_table = SCM_SKU_MAPPER_TABLE_MAPPING.get(marketplace_id)
+        if sku_mapper_table and not mssql_df.empty:
+            try:
+                # Select only required columns that exist
+                available_cols = [col for col in SCM_SKU_MAPPER_COLUMNS if col in mssql_df.columns]
+                missing_cols = [col for col in SCM_SKU_MAPPER_COLUMNS if col not in mssql_df.columns]
+                
+                if missing_cols:
+                    logger.warning(f"SCM SKU Mapper: Missing columns: {missing_cols}")
+                
+                if available_cols:
+                    scm_sku_df = mssql_df[available_cols].copy()
+                    
+                    # Convert PurchaseDate_conversion to proper format
+                    if 'PurchaseDate_conversion' in scm_sku_df.columns:
+                        scm_sku_df['PurchaseDate_conversion'] = pd.to_datetime(
+                            scm_sku_df['PurchaseDate_conversion']
+                        ).dt.strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    logger.info(f"🔄 Saving SCM SKU Mapper data: {len(scm_sku_df)} records to {sku_mapper_table}")
+                    logger.info(f"SCM SKU Mapper columns: {list(scm_sku_df.columns)}")
+                    
+                    _to_sql_with_retries(
+                        scm_sku_df,
+                        engine=MSSQL_engine,
+                        table_name=sku_mapper_table,
+                        if_exists='append',
+                        index=False,
+                        max_retries=3,
+                        base_backoff=1.0,
+                    )
+                    
+                    results['scm_sku_mapper_result'] = {
+                        'success': True,
+                        'records_saved': len(scm_sku_df),
+                        'table_name': sku_mapper_table
+                    }
+                    results['total_records_saved'] += len(scm_sku_df)
+                    logger.info(f"✅ SCM SKU Mapper save successful: {len(scm_sku_df)} records to {sku_mapper_table}")
+                else:
+                    logger.warning(f"SCM SKU Mapper: No valid columns found in mssql_df")
+                    results['scm_sku_mapper_result'] = {
+                        'success': False,
+                        'error': 'No valid columns found',
+                        'records_saved': 0
+                    }
+                    
+            except Exception as sku_error:
+                logger.error(f"❌ SCM SKU Mapper save failed: {sku_error}", exc_info=True)
+                results['scm_sku_mapper_result'] = {
+                    'success': False,
+                    'error': str(sku_error),
+                    'records_saved': 0,
+                    'table_name': sku_mapper_table
+                }
+                results['errors'].append(f"SCM SKU Mapper save failed: {str(sku_error)}")
+        else:
+            logger.info(f"SCM SKU Mapper: No table mapping for marketplace {marketplace_id} or empty DataFrame")
+        
+        # 2. Save azure_df subset to scm_amazon_orders table
+        if not azure_df.empty:
+            try:
+                # Select only required columns that exist
+                available_cols = [col for col in SCM_AMAZON_ORDERS_COLUMNS if col in azure_df.columns]
+                missing_cols = [col for col in SCM_AMAZON_ORDERS_COLUMNS if col not in azure_df.columns]
+                
+                if missing_cols:
+                    logger.warning(f"SCM Amazon Orders: Missing columns: {missing_cols}")
+                
+                if available_cols:
+                    scm_orders_df = azure_df[available_cols].copy()
+                    
+                    # Convert CLEAN_DateTime to proper format if it exists
+                    if 'CLEAN_DateTime' in scm_orders_df.columns:
+                        scm_orders_df['CLEAN_DateTime'] = pd.to_datetime(
+                            scm_orders_df['CLEAN_DateTime']
+                        ).dt.strftime('%Y-%m-%d %H:%M:%S')
+
+                    # Ensure CLEAN_DateTime is datetime64[ns] without timezone
+                    if 'CLEAN_DateTime' in scm_orders_df.columns:
+                        scm_orders_df['CLEAN_DateTime'] = pd.to_datetime(scm_orders_df['CLEAN_DateTime'], errors='coerce', utc=False)
+                        # If any tz-aware slipped in, convert to naive
+                        if hasattr(scm_orders_df['CLEAN_DateTime'].dtype, 'tz') and scm_orders_df['CLEAN_DateTime'].dt.tz is not None:
+                            scm_orders_df['CLEAN_DateTime'] = scm_orders_df['CLEAN_DateTime'].dt.tz_convert('UTC').dt.tz_localize(None)
+
+                    # Derive Date as date only from CLEAN_DateTime when available, else coerce
+                    if 'CLEAN_DateTime' in scm_orders_df.columns:
+                        scm_orders_df['Date'] = pd.to_datetime(scm_orders_df['CLEAN_DateTime'].dt.date, errors='coerce')
+                    elif 'Date' in scm_orders_df.columns:
+                        scm_orders_df['Date'] = pd.to_datetime(scm_orders_df['Date'], errors='coerce')
+                        
+                    logger.info(f"🔄 Saving SCM Amazon Orders data: {len(scm_orders_df)} records to scm_amazon_orders")
+                    logger.info(f"SCM Amazon Orders columns: {list(scm_orders_df.columns)}")
+                    
+                    _to_sql_with_retries(
+                        scm_orders_df,
+                        engine=MSSQL_engine,
+                        table_name='scm_amazon_orders',
+                        if_exists='append',
+                        index=False,
+                        max_retries=3,
+                        base_backoff=1.0,
+                    )
+                    
+                    results['scm_amazon_orders_result'] = {
+                        'success': True,
+                        'records_saved': len(scm_orders_df),
+                        'table_name': 'scm_amazon_orders'
+                    }
+                    results['total_records_saved'] += len(scm_orders_df)
+                    logger.info(f"✅ SCM Amazon Orders save successful: {len(scm_orders_df)} records")
+                else:
+                    logger.warning(f"SCM Amazon Orders: No valid columns found in azure_df")
+                    results['scm_amazon_orders_result'] = {
+                        'success': False,
+                        'error': 'No valid columns found',
+                        'records_saved': 0
+                    }
+                    
+            except Exception as orders_error:
+                logger.error(f"❌ SCM Amazon Orders save failed: {orders_error}", exc_info=True)
+                results['scm_amazon_orders_result'] = {
+                    'success': False,
+                    'error': str(orders_error),
+                    'records_saved': 0,
+                    'table_name': 'scm_amazon_orders'
+                }
+                results['errors'].append(f"SCM Amazon Orders save failed: {str(orders_error)}")
+        else:
+            logger.info("SCM Amazon Orders: Empty azure_df, skipping save")
+        
+        # Set overall success based on results
+        if results['errors']:
+            results['success'] = False
+            
+    except Exception as e:
+        logger.error(f"❌ SCM data save failed: {e}", exc_info=True)
+        results['success'] = False
+        results['errors'].append(f"SCM data save failed: {str(e)}")
+    
+    return results
+
+
 def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: str) -> Dict:
     """
     Simple database save that relies on pandas to_sql auto-column matching.
@@ -128,7 +344,7 @@ def save_simple(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: 
         'A1F83G8C2ARO7P': 'amazon_api_uk',  # United Kingdom
         'ATVPDKIKX0DER': 'amazon_api_usa',  # United States
         'A2EUQ1WTGCTBG2': 'amazon_api_ca',  # Canada
-        'A13V1IB3VIYZZH': 'amazon_api_fr_test',  # France
+        'A13V1IB3VIYZZH': 'amazon_api_fr',  # France
         
     }
     

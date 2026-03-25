@@ -907,7 +907,7 @@ class AmazonDataProcessor:
         """
         Ensure all required Azure database columns are present with proper data types and defaults.
         
-        Based on Azure database schema: stg_tr_amazon_raw_test
+        Based on Azure database schema: stg_tr_amazon_raw
         """
         # Define the exact column order and types as per Azure database schema (excluding IDENTITY id)
         required_columns = {
@@ -996,6 +996,12 @@ class AmazonDataProcessor:
             start_time = datetime.now()
             logger.info(f"Starting data processing for {marketplace_name}")
             
+            # Handle empty data case - return empty DataFrames
+            if not orders_data or len(orders_data) == 0:
+                logger.info("No orders data to process - returning empty DataFrames")
+                return pd.DataFrame(), pd.DataFrame()
+            
+            # Standard data processing
             # 1. Prepare and merge data
             merged_df = self._prepare_dataframes(orders_data, order_items_data)
             
