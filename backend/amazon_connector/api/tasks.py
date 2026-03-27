@@ -18,13 +18,10 @@ from .marketplaces_creds import (
     MARKETPLACE_CREDENTIAL_MAP,
     get_credentials_for_marketplace,
     get_credential_group_for_marketplace,
+    normalize_company_name,
 )
 
 logger = logging.getLogger(__name__)
-
-def normalize_company_name(company_name: str | None) -> str:
-    return (company_name or DEFAULT_COMPANY_NAME).strip()
-
 
 def get_credentials(marketplace_id: str, company_name: str | None = None) -> dict:
     return get_credentials_for_marketplace(marketplace_id, normalize_company_name(company_name))
