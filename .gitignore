@@ -129,3 +129,5 @@ inventory.py
 processed_data/
 
 marketplaces_creds.py
+
+creds_inventory.json
