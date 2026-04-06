@@ -9,10 +9,12 @@ def save_inventory_report_to_azure(csv_path: str, latest_report: dict, marketpla
     engine = create_Azure_db_connection()
     report_id = latest_report.get('reportId')
 
-    with engine.begin() as conn: # begin() auto-commits or rolls back on error
-        conn.execute(text("""
-            TRUNCATE TABLE dbo.FBA_Inventory_Report
-            """))
+    with engine.begin() as conn:  # begin() auto-commits or rolls back on error
+        # Delete only this marketplace's rows so other regions are not wiped
+        conn.execute(
+            text("DELETE FROM dbo.FBA_Inventory_Report WHERE store = :store"),
+            {'store': marketplace_code}
+        )
 
     df = pd.read_csv(csv_path)
     df.columns = df.columns.str.lower()

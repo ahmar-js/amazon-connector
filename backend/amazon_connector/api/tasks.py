@@ -201,6 +201,7 @@ def fetch_orders_for_marketplace(self, marketplace_id: str, start_iso: str, end_
             "start_date": start_iso,
             "end_date": end_iso,
             "auto_save": True,
+            "dates_in_utc": True,
         }
 
         logger.info(f"[fetch_orders_for_marketplace] {marketplace_id}/{resolved_company} -> {start_iso} to {end_iso}")
@@ -497,6 +498,7 @@ def fetch_missing_orders_usa_day(self, day_str: str):
             "start_date": start_iso,
             "end_date": end_iso,
             "auto_save": True,
+            "dates_in_utc": True,
         }
 
         logger.info(f"[fetch_missing_orders_{MARKETPLACE_NAME}_day] {MARKETPLACE_NAME} -> {start_iso} to {end_iso}")
@@ -733,6 +735,7 @@ def fetch_scm_for_marketplace(self, marketplace_id: str, start_iso: str, end_iso
             "start_date": start_iso,
             "end_date": end_iso,
             "auto_save": True,
+            "dates_in_utc": True,
             "data_type": "scm_data",  # This triggers SCM processing
         }
 
@@ -835,7 +838,7 @@ def fetch_scm_for_marketplace(self, marketplace_id: str, start_iso: str, end_iso
                     f"Company: {resolved_company}. "
                     f"Data not yet available. Retrying in 1 hour."
                 )
-                raise self.retry(exc=Exception(f"Amazon data delay - HTTP 400"), countdown=3600, max_retries=3)
+                raise self.retry(exc=Exception(f"Amazon data delay - HTTP 400"), countdown=3600, max_retries=5)
             
             raise Exception(f"HTTP {response.status_code}")
 

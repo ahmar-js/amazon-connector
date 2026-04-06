@@ -17,6 +17,7 @@ import pytz
 from .inventory_mssql import save_inventory_report_to_mssql
 from .inventory_azure import save_inventory_report_to_azure
 from .marketplaces import MARKETPLACE_IDS, get_region_from_marketplace_id, get_available_marketplaces
+from .marketplaces_creds import CREDENTIALS, find_credential_group_for_marketplace, normalize_company_name, ACTIVE_COMPANIES, GROUP_TO_COMPANY
 # Set up logging
 logger = logging.getLogger(__name__)
 
@@ -255,9 +256,9 @@ class FetchInventoryReportView(View):
     """
     
     def load_credentials(self):
-        """Load credentials from creds.json file"""
+        """Load credentials from creds_inventory.json file"""
         try:
-            creds_path = Path(__file__).parent.parent / "creds.json"
+            creds_path = Path(__file__).parent.parent / "creds_inventory.json"
             
             # Security check: ensure file exists and is readable
             if not creds_path.exists():
@@ -282,7 +283,7 @@ class FetchInventoryReportView(View):
             raise Exception("Credentials file not found. Please configure Amazon API credentials first.")
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in credentials file: {e}")
-            raise Exception("Invalid credentials file format. Please check your creds.json file.")
+            raise Exception("Invalid credentials file format. Please check your creds_inventory.json file.")
         except Exception as e:
             logger.error(f"Failed to load credentials: {e}")
             raise Exception(f"Credentials loading failed: {e}")
@@ -291,16 +292,20 @@ class FetchInventoryReportView(View):
         """Determine region based on marketplace ID"""
         return get_region_from_marketplace_id(marketplace_id)
     
-    def create_activity_record(self, marketplace_id, date_from, date_to):
-        """Create an activity record for tracking"""
+    def create_activity_record(self, marketplace_id, date_from, date_to, company_name=''):
+        """Get or create an activity record for tracking.
+        Uses get_or_create so re-running on the same day reuses the existing in_progress record
+        instead of violating the unique constraint.
+        """
         activity = Activities.objects.create(
-            activity_id=uuid.uuid4(),
+            company_name=company_name,
             marketplace_id=marketplace_id,
             activity_type='reports',
             date_from=date_from,
             date_to=date_to,
-            action='manual',
-            status='in_progress'
+            action = 'manual',
+            status='in_progress',
+            # activtiy_id=uuid.uuid4(),
         )
         return activity
     
@@ -330,7 +335,6 @@ class FetchInventoryReportView(View):
         start_time = time.time()
         
         try:
-            # Parse request data
             try:
                 data = json.loads(request.body) if request.body else {}
                 logger.info(f"Data: {data}")
@@ -342,13 +346,12 @@ class FetchInventoryReportView(View):
                     'details': str(e)
                 }, status=400)
             
-            # Get marketplaces to fetch (default to all if not specified)
+            # Accept 'warehouse_codes' or 'marketplaces'; default to all
             default_marketplaces = list(get_available_marketplaces().keys())
-            marketplaces = data.get('marketplaces', default_marketplaces)
+            marketplaces = data.get('warehouse_codes') or data.get('marketplaces', default_marketplaces)
             if isinstance(marketplaces, str):
                 marketplaces = [marketplaces]
             
-            # Validate marketplaces
             invalid_marketplaces = [mp for mp in marketplaces if mp not in MARKETPLACE_IDS]
             if invalid_marketplaces:
                 return JsonResponse({
@@ -356,211 +359,236 @@ class FetchInventoryReportView(View):
                     'error': f'Invalid marketplace(s): {invalid_marketplaces}',
                     'valid_marketplaces': list(MARKETPLACE_IDS.keys())
                 }, status=400)
-            
-            # Load credentials
-            try:
-                creds = self.load_credentials()
-            except Exception as e:
-                return JsonResponse({
-                    'success': False,
-                    'error': 'Failed to load credentials',
-                    'details': str(e)
-                }, status=500)
-            
-            # --------------------------Need to remove this functionality--------------------------
+
             # Get date range (previous day)
             today = datetime.now(timezone.utc).date()
             yesterday = today - timedelta(days=1)
-            
-            # Date range for filtering reports (previous day)
             created_after = yesterday.strftime('%Y-%m-%dT00:00:00Z')
             created_before = yesterday.strftime('%Y-%m-%dT23:59:59Z')
-            #-----------------------------------------------------------------------------------
+
+            # Group marketplaces by credential group; authenticate once per group
+            group_to_codes: dict = {}
             results = {}
+            for code in marketplaces:
+                marketplace_id = MARKETPLACE_IDS[code]
+                try:
+                    group = find_credential_group_for_marketplace(marketplace_id)
+                except KeyError:
+                    results[code] = {'success': False, 'error': f'No credential group found for marketplace {code}'}
+                    continue
+                group_to_codes.setdefault(group, []).append(code)
+
             total_reports_found = 0
             total_items_processed = 0
-            
-            # Process each marketplace
-            for marketplace_code in marketplaces:
-                marketplace_id = MARKETPLACE_IDS[marketplace_code]
-                region = self.get_region_from_marketplace(marketplace_id)
-                
-                # Create activity record
-                activity = self.create_activity_record(
-                    marketplace_id=marketplace_id,
-                    date_from=yesterday,
-                    date_to=yesterday
-                )
-                
-                try:
-                    # Initialize inventory report fetcher
-                    inventory_fetcher = FetchInventoryReport(
-                        refresh_token=creds['refresh_token'],
-                        lwa_client_id=creds['app_id'],
-                        lwa_client_secret=creds['client_secret'],
-                        region=region,
-                        marketplace_id=marketplace_id
+
+            for group_name, codes in group_to_codes.items():
+                creds = CREDENTIALS[group_name]
+                logger.info(f"Using credential group '{group_name}' for marketplaces: {codes}")
+
+                for marketplace_code in codes:
+                    marketplace_id = MARKETPLACE_IDS[marketplace_code]
+                    region = self.get_region_from_marketplace(marketplace_id)
+                    company_name_for_activity = GROUP_TO_COMPANY.get(group_name, group_name)
+
+                    activity = self.create_activity_record(
+                        marketplace_id=marketplace_id,
+                        date_from=yesterday,
+                        date_to=yesterday,
+                        company_name=company_name_for_activity
                     )
-                    
-                    # Fetch reports for previous day
-                    logger.info(f"Fetching inventory reports for {marketplace_code} ({marketplace_id})")
-                    reports = inventory_fetcher.fetch_reports(
-                        created_after=created_after,
-                        created_before=created_before
-                    )
-                    
-                    if not reports:
-                        logger.info(f"No inventory reports found for {marketplace_code} for yesterday")
+
+                    try:
+                        inventory_fetcher = FetchInventoryReport(
+                            refresh_token=creds['refresh_token'],
+                            lwa_client_id=creds['app_id'],
+                            lwa_client_secret=creds['client_secret'],
+                            region=region,
+                            marketplace_id=marketplace_id
+                        )
+
+                        logger.info(f"Fetching inventory reports for {marketplace_code} ({marketplace_id})")
+                        reports = inventory_fetcher.fetch_reports(
+                            created_after=created_after,
+                            created_before=created_before
+                        )
+
+                        if not reports:
+                            logger.info(f"No inventory reports found for {marketplace_code}, saving empty record to DB")
+                            reports_dir = Path(__file__).parent.parent / "processed_data" / "inventory_reports"
+                            reports_dir.mkdir(parents=True, exist_ok=True)
+                            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                            csv_path = str(reports_dir / f"inventory_{marketplace_code}_{timestamp}_empty.csv")
+                            pd.DataFrame(columns=[
+                                'sku', 'fnsku', 'asin', 'product-name', 'condition', 'your-price',
+                                'mfn-listing-exists', 'mfn-fulfillable-quantity', 'afn-listing-exists',
+                                'afn-warehouse-quantity', 'afn-fulfillable-quantity', 'afn-unsellable-quantity',
+                                'afn-reserved-quantity', 'afn-total-quantity', 'per-unit-volume',
+                                'afn-inbound-working-quantity', 'afn-inbound-shipped-quantity',
+                                'afn-inbound-receiving-quantity',
+                            ]).to_csv(csv_path, index=False)
+                            synthetic_report = {
+                                'reportId': f'EMPTY_{marketplace_code}_{timestamp}',
+                                'reportType': 'GET_FBA_MYI_ALL_INVENTORY_DATA',
+                                'period': None,
+                                'createdTime': datetime.now(timezone.utc).isoformat(),
+                                'dataStartTime': yesterday.isoformat(),
+                                'dataEndTime': yesterday.isoformat(),
+                            }
+                            mssql_saved_empty = False
+                            azure_saved_empty = False
+                            try:
+                                mssql_save = save_inventory_report_to_mssql(
+                                    csv_path=csv_path,
+                                    latest_report=synthetic_report,
+                                    marketplace_code=marketplace_code,
+                                    items_count=0
+                                )
+                                mssql_saved_empty = mssql_save.get('success', False)
+                            except Exception as mssql_err:
+                                logger.error(f"MSSQL empty save failed for {marketplace_code}: {mssql_err}")
+                                mssql_save = {'success': False, 'error': str(mssql_err)}
+                            try:
+                                azure_save = save_inventory_report_to_azure(
+                                    csv_path=csv_path,
+                                    latest_report=synthetic_report,
+                                    marketplace_code=marketplace_code,
+                                    items_count=0
+                                )
+                                azure_saved_empty = azure_save.get('success', False)
+                            except Exception as azure_err:
+                                logger.error(f"Azure empty save failed for {marketplace_code}: {azure_err}")
+                                azure_save = {'success': False, 'error': str(azure_err)}
+                            results[marketplace_code] = {
+                                'success': True,
+                                'reports_found': 0,
+                                'credential_group': group_name,
+                                'items_count': 0,
+                                'message': 'No reports found for yesterday; empty record saved to DB',
+                                'activity_id': str(activity.activity_id),
+                                'mssql_save': mssql_save,
+                                'azure_save': azure_save,
+                            }
+                            self.update_activity_record(
+                                activity=activity,
+                                status='completed',
+                                items_fetched=0,
+                                duration_seconds=time.time() - start_time,
+                                mssql_saved=mssql_saved_empty,
+                                azure_saved=azure_saved_empty,
+                                detail_message='No inventory reports found; empty record saved to DB'
+                            )
+                            continue
+
+                        latest_report = max(reports, key=lambda x: x['createdTime'])
+                        report_id = latest_report['reportId']
+
+                        logger.info(f"Processing report {report_id} for {marketplace_code}")
+
+                        document_id = inventory_fetcher.get_document_info(report_id)
+                        access_token = inventory_fetcher.get_access_token()
+                        download_url = inventory_fetcher.get_presigned_url(access_token, document_id)
+
+                        reports_dir = Path(__file__).parent.parent / "processed_data" / "inventory_reports"
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        file_path = reports_dir / f"inventory_{marketplace_code}_{timestamp}.tsv"
+
+                        csv_path, items_count = inventory_fetcher.download_and_save_report(
+                            download_url, str(file_path)
+                        )
+
+                        mssql_saved = False
+                        azure_saved = False
+
+                        try:
+                            mssql_save = save_inventory_report_to_mssql(
+                                csv_path=csv_path,
+                                latest_report=latest_report,
+                                marketplace_code=marketplace_code,
+                                items_count=items_count
+                            )
+                            logger.info(f"MSSQL save result: {mssql_save}")
+                            mssql_saved = mssql_save.get('success', False)
+                        except Exception as mssql_err:
+                            logger.error(f"MSSQL save failed for {marketplace_code}: {mssql_err}")
+                            mssql_save = {'success': False, 'error': str(mssql_err)}
+
+                        try:
+                            azure_save = save_inventory_report_to_azure(
+                                csv_path=csv_path,
+                                latest_report=latest_report,
+                                marketplace_code=marketplace_code,
+                                items_count=items_count
+                            )
+                            logger.info(f"Azure save result: {azure_save}")
+                            azure_saved = azure_save.get('success', False)
+                        except Exception as azure_err:
+                            logger.error(f"Azure save failed for {marketplace_code}: {azure_err}")
+                            azure_save = {'success': False, 'error': str(azure_err)}
+
+                        if mssql_saved and azure_saved:
+                            db_status = 'Both databases saved successfully'
+                            detail_suffix = '✓ Both DBs'
+                        elif mssql_saved:
+                            db_status = 'MSSQL saved, Azure failed'
+                            detail_suffix = '✓ MSSQL only'
+                        elif azure_saved:
+                            db_status = 'Azure saved, MSSQL failed'
+                            detail_suffix = '✓ Azure only'
+                        else:
+                            db_status = 'Both database saves failed'
+                            detail_suffix = '✗ DB save failed'
+
+                        detail_message = f'Fetched {items_count} items | {detail_suffix}'
+                        total_reports_found += 1
+                        total_items_processed += items_count
+
                         results[marketplace_code] = {
                             'success': True,
-                            'reports_found': 0,
-                            'message': 'No reports found for yesterday',
-                            'activity_id': str(activity.activity_id)
+                            'reports_found': 1,
+                            'credential_group': group_name,
+                            'report_id': report_id,
+                            'document_id': document_id,
+                            'items_count': items_count,
+                            'file_path': csv_path,
+                            'created_time': latest_report['createdTime'],
+                            'activity_id': str(activity.activity_id),
+                            'mssql_save': mssql_save,
+                            'azure_save': azure_save,
+                            'database_status': db_status
                         }
-                        # Update activity with no database saves since no data to save
+
                         self.update_activity_record(
                             activity=activity,
                             status='completed',
+                            items_fetched=items_count,
+                            duration_seconds=time.time() - start_time,
+                            mssql_saved=mssql_saved,
+                            azure_saved=azure_saved,
+                            detail_message=detail_message
+                        )
+
+                        logger.info(f"Successfully processed inventory report for {marketplace_code}")
+                        logger.info(f"Database save status - MSSQL: {mssql_saved}, Azure: {azure_saved}")
+
+                    except Exception as e:
+                        logger.error(f"Error processing {marketplace_code}: {e}")
+                        results[marketplace_code] = {
+                            'success': False,
+                            'error': str(e),
+                            'credential_group': group_name,
+                            'activity_id': str(activity.activity_id)
+                        }
+                        self.update_activity_record(
+                            activity=activity,
+                            status='failed',
                             items_fetched=0,
                             duration_seconds=time.time() - start_time,
+                            error_message=str(e),
                             mssql_saved=False,
                             azure_saved=False,
-                            detail_message='No inventory reports found for yesterday'
+                            detail_message=f'Failed to process inventory report: {str(e)}'
                         )
-                        continue
-                    
-                    # Process the most recent report
-                    latest_report = max(reports, key=lambda x: x['createdTime'])
-                    report_id = latest_report['reportId']
-                    
-                    logger.info(f"Processing report {report_id} for {marketplace_code}")
-                    
-                    # Get document ID
-                    document_id = inventory_fetcher.get_document_info(report_id)
-                    
-                    # Get presigned URL for download
-                    access_token = inventory_fetcher.get_access_token()
-                    download_url = inventory_fetcher.get_presigned_url(access_token, document_id)
-                    
-                    # Create file path for saving
-                    reports_dir = Path(__file__).parent.parent / "processed_data" / "inventory_reports"
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    file_path = reports_dir / f"inventory_{marketplace_code}_{timestamp}.tsv"
-                    
-                    # Download and save report
-                    csv_path, items_count = inventory_fetcher.download_and_save_report(
-                        download_url, str(file_path)
-                    )
-                    
-                    # Initialize save status flags
-                    mssql_saved = False
-                    azure_saved = False
-                    
-                    # Persist to MSSQL database
-                    try:
-                        mssql_save = save_inventory_report_to_mssql(
-                            csv_path=csv_path,
-                            latest_report=latest_report,
-                            marketplace_code=marketplace_code,
-                            items_count=items_count
-                        )
-                        logger.info(f"MSSQL save result: {mssql_save}")
-                        mssql_saved = mssql_save.get('success', False)
-                    except Exception as mssql_err:
-                        logger.error(f"MSSQL save failed for {marketplace_code}: {mssql_err}")
-                        mssql_save = {
-                            'success': False,
-                            'error': str(mssql_err)
-                        }
-                        mssql_saved = False
-                    
-                    # Persist to Azure database
-                    try:
-                        azure_save = save_inventory_report_to_azure(
-                            csv_path=csv_path,
-                            latest_report=latest_report,
-                            marketplace_code=marketplace_code,
-                            items_count=items_count
-                        )
-                        logger.info(f"Azure save result: {azure_save}")
-                        azure_saved = azure_save.get('success', False)
-                    except Exception as azure_err:
-                        logger.error(f"Azure save failed for {marketplace_code}: {azure_err}")
-                        azure_save = {
-                            'success': False,
-                            'error': str(azure_err)
-                        }
-                        azure_saved = False
-                    
-                    # Build detail message including database save status
-                    detail_parts = []
-                    detail_parts.append(f'Fetched {items_count} items')
-                    
-                    if mssql_saved and azure_saved:
-                        detail_parts.append('✓ Both DBs')
-                        db_status = 'Both databases saved successfully'
-                    elif mssql_saved:
-                        detail_parts.append('✓ MSSQL only')
-                        db_status = 'MSSQL saved, Azure failed'
-                    elif azure_saved:
-                        detail_parts.append('✓ Azure only')
-                        db_status = 'Azure saved, MSSQL failed'
-                    else:
-                        detail_parts.append('✗ DB save failed')
-                        db_status = 'Both database saves failed'
-                    
-                    detail_message = ' | '.join(detail_parts)
-                    
-                    total_reports_found += 1
-                    total_items_processed += items_count
-                    
-                    results[marketplace_code] = {
-                        'success': True,
-                        'reports_found': 1,
-                        'report_id': report_id,
-                        'document_id': document_id,
-                        'items_count': items_count,
-                        'file_path': csv_path,
-                        'created_time': latest_report['createdTime'],
-                        'activity_id': str(activity.activity_id),
-                        'mssql_save': mssql_save,
-                        'azure_save': azure_save,
-                        'database_status': db_status
-                    }
-                    
-                    # Update activity record with database save status
-                    self.update_activity_record(
-                        activity=activity,
-                        status='completed',
-                        items_fetched=items_count,
-                        duration_seconds=time.time() - start_time,
-                        mssql_saved=mssql_saved,
-                        azure_saved=azure_saved,
-                        detail_message=detail_message
-                    )
-                    
-                    logger.info(f"Successfully processed inventory report for {marketplace_code}")
-                    logger.info(f"Database save status - MSSQL: {mssql_saved}, Azure: {azure_saved}")
-                    
-                except Exception as e:
-                    logger.error(f"Error processing {marketplace_code}: {e}")
-                    results[marketplace_code] = {
-                        'success': False,
-                        'error': str(e),
-                        'activity_id': str(activity.activity_id)
-                    }
-                    # Update activity record with failed status and no database saves
-                    self.update_activity_record(
-                        activity=activity,
-                        status='failed',
-                        items_fetched=0,
-                        duration_seconds=time.time() - start_time,
-                        error_message=str(e),
-                        mssql_saved=False,
-                        azure_saved=False,
-                        detail_message=f'Failed to process inventory report: {str(e)}'
-                    )
-            
+
             return JsonResponse({
                 'success': True,
                 'message': f'Inventory report fetch completed for {len(marketplaces)} marketplace(s)',
@@ -573,7 +601,7 @@ class FetchInventoryReportView(View):
                     'to': yesterday.isoformat()
                 }
             })
-            
+
         except Exception as e:
             logger.error(f"Unexpected error in FetchInventoryReportView: {e}")
             return JsonResponse({
@@ -624,7 +652,7 @@ class CreateReportScheduleView(View):
     """Create a report schedule for specified marketplace(s)."""
 
     def load_credentials(self):
-        creds_path = Path(__file__).parent.parent / "creds.json"
+        creds_path = Path(__file__).parent.parent / "creds_inventory.json"
         if not creds_path.exists():
             raise Exception("Credentials file not found. Please connect first.")
         with open(creds_path, 'r') as f:
@@ -669,12 +697,14 @@ class CreateReportScheduleView(View):
         next_report_creation_time = body.get('nextReportCreationTime')  # optional local or UTC ISO timestamp
         time_zone = body.get('timeZone', 'Asia/Karachi')  # default to PKT for better UX
         report_options = body.get('reportOptions')  # optional dict
+        _raw_company = body.get('companyName')
+        company_name = normalize_company_name(_raw_company) if _raw_company else None
         default_marketplaces = list(get_available_marketplaces().keys())
         marketplaces = body.get('marketplaces', default_marketplaces)
         if isinstance(marketplaces, str):
             marketplaces = [marketplaces]
 
-        # Validate marketplaces codes
+        # Validate marketplace codes
         invalid = [m for m in marketplaces if m not in MARKETPLACE_IDS]
         if invalid:
             return JsonResponse({
@@ -683,50 +713,67 @@ class CreateReportScheduleView(View):
                 'valid_marketplaces': list(MARKETPLACE_IDS.keys()),
             }, status=400)
 
-        # Load creds and token
-        try:
-            creds = self.load_credentials()
-            access_token = self._get_access_token(creds)
-        except Exception as e:
-            return JsonResponse({'success': False, 'error': str(e)}, status=500)
+        # Normalize nextReportCreationTime once up front
+        normalized_time = None
+        if next_report_creation_time:
+            try:
+                normalized_time = self._normalize_to_utc_z(next_report_creation_time, time_zone)
+            except Exception as e:
+                return JsonResponse({'success': False, 'error': f'Invalid nextReportCreationTime: {e}'}, status=400)
 
+        # Group marketplaces by credential group so we authenticate once per group
         results = {}
+        group_to_codes: dict = {}
         for code in marketplaces:
             marketplace_id = MARKETPLACE_IDS[code]
-            region = self.get_region_from_marketplace(marketplace_id)
-            url = f"https://sellingpartnerapi-{region}.amazon.com/reports/2021-06-30/schedules"
-
-            payload = {
-                "reportType": report_type,
-                "marketplaceIds": [marketplace_id],
-                "period": period,
-            }
-            if next_report_creation_time:
-                # Normalize to UTC Z format for SP-API
-                try:
-                    payload["nextReportCreationTime"] = self._normalize_to_utc_z(next_report_creation_time, time_zone)
-                except Exception as e:
-                    results[code] = { 'success': False, 'error': f"Invalid nextReportCreationTime: {e}" }
-                    continue
-            if isinstance(report_options, dict):
-                payload["reportOptions"] = report_options
-
-            headers = {
-                'x-amz-access-token': access_token,
-                'accept': 'application/json',
-                'content-type': 'application/json',
-                'User-Agent': 'AmazonConnector/1.0'
-            }
-
             try:
-                resp = requests.post(url, headers=headers, json=payload, timeout=30)
-                resp.raise_for_status()
-                data = resp.json()
-                results[code] = { 'success': True, 'schedule': data }
-            except requests.exceptions.RequestException as e:
-                results[code] = { 'success': False, 'error': str(e), 'response': getattr(e, 'response', None).text if getattr(e, 'response', None) is not None else None }
+                group = find_credential_group_for_marketplace(marketplace_id, company_name)
+            except KeyError:
+                results[code] = {'success': False, 'error': f'No credential group found for marketplace {code}'}
+                continue
+            group_to_codes.setdefault(group, []).append(code)
+
+        # Process each credential group with its own access token
+        for group_name, codes in group_to_codes.items():
+            creds = CREDENTIALS[group_name]
+            try:
+                access_token = self._get_access_token(creds)
             except Exception as e:
-                results[code] = { 'success': False, 'error': str(e) }
+                for code in codes:
+                    results[code] = {'success': False, 'error': f'Authentication failed for group {group_name}: {e}'}
+                continue
+
+            for code in codes:
+                marketplace_id = MARKETPLACE_IDS[code]
+                region = self.get_region_from_marketplace(marketplace_id)
+                url = f"https://sellingpartnerapi-{region}.amazon.com/reports/2021-06-30/schedules"
+
+                payload = {
+                    "reportType": report_type,
+                    "marketplaceIds": [marketplace_id],
+                    "period": period,
+                }
+                if normalized_time:
+                    payload["nextReportCreationTime"] = normalized_time
+                if isinstance(report_options, dict) and report_options:
+                    payload["reportOptions"] = report_options
+
+                headers = {
+                    'x-amz-access-token': access_token,
+                    'accept': 'application/json',
+                    'content-type': 'application/json',
+                    'User-Agent': 'AmazonConnector/1.0'
+                }
+
+                try:
+                    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+                    resp.raise_for_status()
+                    results[code] = {'success': True, 'schedule': resp.json(), 'credential_group': group_name}
+                except requests.exceptions.RequestException as e:
+                    error_body = e.response.text if getattr(e, 'response', None) is not None else None
+                    results[code] = {'success': False, 'error': str(e), 'response': error_body}
+                except Exception as e:
+                    results[code] = {'success': False, 'error': str(e)}
 
         return JsonResponse({
             'success': True,
@@ -778,7 +825,7 @@ class GetReportSchedulesView(View):
     """List report schedules with optional filters."""
 
     def load_credentials(self):
-        creds_path = Path(__file__).parent.parent / "creds.json"
+        creds_path = Path(__file__).parent.parent / "creds_inventory.json"
         if not creds_path.exists():
             raise Exception("Credentials file not found. Please connect first.")
         with open(creds_path, 'r') as f:
@@ -808,10 +855,10 @@ class GetReportSchedulesView(View):
 
     def get(self, request):
         start_time = time.time()
-        # query params: marketplaces (codes), reportTypes (comma-separated), pageSize
-        marketplaces = request.GET.get('marketplaces')  # e.g., "IT,DE"
-        if marketplaces:
-            marketplaces = [m.strip() for m in marketplaces.split(',') if m.strip()]
+        # query params: marketplaces (codes, comma-separated), companyName, reportTypes
+        marketplaces_param = request.GET.get('marketplaces')
+        if marketplaces_param:
+            marketplaces = [m.strip() for m in marketplaces_param.split(',') if m.strip()]
         else:
             marketplaces = list(get_available_marketplaces().keys())
 
@@ -823,33 +870,44 @@ class GetReportSchedulesView(View):
                 'valid_marketplaces': list(MARKETPLACE_IDS.keys()),
             }, status=400)
 
+        _raw_company = request.GET.get('companyName')
+        company_name = normalize_company_name(_raw_company) if _raw_company else None
         # reportTypes is REQUIRED by SP-API. Default to inventory report if omitted.
         report_types = request.GET.get('reportTypes') or 'GET_FBA_MYI_ALL_INVENTORY_DATA'
-        page_size = request.GET.get('pageSize')
-        try:
-            page_size = int(page_size) if page_size else None
-        except ValueError:
-            return JsonResponse({'success': False, 'error': 'pageSize must be integer'}, status=400)
 
-        try:
-            creds = self.load_credentials()
-            access_token = self._get_access_token(creds)
-        except Exception as e:
-            return JsonResponse({'success': False, 'error': str(e)}, status=500)
-
+        # Group marketplaces by credential group so we authenticate once per group
         results = {}
+        group_to_codes: dict = {}
         for code in marketplaces:
             marketplace_id = MARKETPLACE_IDS[code]
-            region = self.get_region_from_marketplace(marketplace_id)
+            try:
+                group = find_credential_group_for_marketplace(marketplace_id, company_name)
+            except KeyError:
+                results[code] = {'success': False, 'error': f'No credential group found for marketplace {code}'}
+                continue
+            group_to_codes.setdefault(group, []).append(code)
+
+        # Collect all schedules across all groups; deduplicate by reportScheduleId
+        seen_schedule_ids = set()
+        all_schedules = []
+
+        for group_name, codes in group_to_codes.items():
+            creds = CREDENTIALS[group_name]
+            try:
+                access_token = self._get_access_token(creds)
+            except Exception as e:
+                for code in codes:
+                    results[code] = {'success': False, 'error': f'Authentication failed for group {group_name}: {e}'}
+                continue
+
+            # SP-API schedules endpoint returns schedules for a credential set,
+            # not per-marketplace, so one call per group is enough.
+            # We use the first marketplace's region for the endpoint.
+            first_marketplace_id = MARKETPLACE_IDS[codes[0]]
+            region = self.get_region_from_marketplace(first_marketplace_id)
             url = f"https://sellingpartnerapi-{region}.amazon.com/reports/2021-06-30/schedules"
 
-            params = {
-                'marketplaceIds': marketplace_id,
-                'reportTypes': report_types,
-            }
-            if page_size:
-                params['pageSize'] = page_size
-
+            params = {'reportTypes': report_types}
             headers = {
                 'x-amz-access-token': access_token,
                 'accept': 'application/json',
@@ -860,27 +918,77 @@ class GetReportSchedulesView(View):
                 resp = requests.get(url, headers=headers, params=params, timeout=30)
                 resp.raise_for_status()
                 data = resp.json()
-                # Normalize to a list of schedules
                 raw_schedules = []
                 if isinstance(data, dict):
-                    if 'reportSchedules' in data:
-                        raw_schedules = data.get('reportSchedules') or []
-                    elif 'schedules' in data and isinstance(data['schedules'], dict):
-                        raw_schedules = data['schedules'].get('reportSchedules') or []
-                # Filter schedules by requested marketplace
-                filtered = [s for s in raw_schedules if marketplace_id in (s.get('marketplaceIds') or [])]
-                results[code] = {
-                    'success': True,
-                    'schedules': { 'reportSchedules': filtered }
-                }
+                    raw_schedules = data.get('reportSchedules') or []
+
+                for s in raw_schedules:
+                    sid = s.get('reportScheduleId')
+                    if sid and sid not in seen_schedule_ids:
+                        seen_schedule_ids.add(sid)
+                        all_schedules.append(s)
+
+                for code in codes:
+                    results[code] = {'success': True, 'credential_group': group_name}
             except requests.exceptions.RequestException as e:
-                results[code] = { 'success': False, 'error': str(e), 'response': getattr(e, 'response', None).text if getattr(e, 'response', None) is not None else None }
+                error_body = e.response.text if getattr(e, 'response', None) is not None else None
+                for code in codes:
+                    results[code] = {'success': False, 'error': str(e), 'response': error_body}
             except Exception as e:
-                results[code] = { 'success': False, 'error': str(e) }
+                for code in codes:
+                    results[code] = {'success': False, 'error': str(e)}
+
+        # Reverse map: marketplace_id -> code (e.g. "APJ6JRA9NG5V4" -> "IT")
+        id_to_code = {v: k for k, v in MARKETPLACE_IDS.items()}
+
+        # Enrich schedules with the human-readable marketplace code
+        for s in all_schedules:
+            ids = s.get('marketplaceIds') or []
+            s['marketplaceCodes'] = [id_to_code.get(mid, mid) for mid in ids]
+
+        # ── Ambiguity analysis ────────────────────────────────────────────────
+        # 1. Schedules with no marketplaceIds (orphaned/global)
+        orphaned = [s for s in all_schedules if not s.get('marketplaceIds')]
+
+        # 2. Multiple schedules for the same marketplace (duplicates)
+        #    Group by each marketplace_id that appears in a schedule
+        marketplace_to_schedules: dict = {}
+        for s in all_schedules:
+            for mid in (s.get('marketplaceIds') or []):
+                marketplace_to_schedules.setdefault(mid, []).append(s)
+
+        duplicate_groups = []
+        for mid, scheds in marketplace_to_schedules.items():
+            if len(scheds) > 1:
+                # Sort by nextReportCreationTime descending; newest = recommended to keep
+                def _ts(sc):
+                    t = sc.get('nextReportCreationTime') or ''
+                    return t
+
+                sorted_scheds = sorted(scheds, key=_ts, reverse=True)
+                duplicate_groups.append({
+                    'marketplaceId': mid,
+                    'marketplaceCode': id_to_code.get(mid, mid),
+                    'count': len(sorted_scheds),
+                    'recommended_keep': sorted_scheds[0].get('reportScheduleId'),
+                    'recommended_cancel': [s.get('reportScheduleId') for s in sorted_scheds[1:]],
+                    'schedules': sorted_scheds,
+                })
+
+        ambiguous_summary = {
+            'orphaned_count': len(orphaned),
+            'orphaned_schedule_ids': [s.get('reportScheduleId') for s in orphaned],
+            'duplicate_marketplace_count': len(duplicate_groups),
+            'duplicate_groups': duplicate_groups,
+        }
+        # ─────────────────────────────────────────────────────────────────────
 
         return JsonResponse({
             'success': True,
-            'results': results,
+            'total_schedules': len(all_schedules),
+            'reportSchedules': all_schedules,
+            'ambiguous': ambiguous_summary,
+            'marketplace_results': results,
             'processing_time_seconds': round(time.time() - start_time, 2)
         })
 
@@ -890,7 +998,7 @@ class CancelReportScheduleView(View):
     """Cancel a report schedule by its ID."""
 
     def load_credentials(self):
-        creds_path = Path(__file__).parent.parent / "creds.json"
+        creds_path = Path(__file__).parent.parent / "creds_inventory.json"
         if not creds_path.exists():
             raise Exception("Credentials file not found. Please connect first.")
         with open(creds_path, 'r') as f:
@@ -920,38 +1028,68 @@ class CancelReportScheduleView(View):
 
     def delete(self, request, report_schedule_id: str):
         start_time = time.time()
+
         try:
-            creds = self.load_credentials()
+            body = json.loads(request.body or '{}')
+        except json.JSONDecodeError as e:
+            return JsonResponse({'success': False, 'error': 'Invalid JSON', 'details': str(e)}, status=400)
+
+        # Accept both 'marketplaceCode' and 'warehouse_code' as aliases
+        marketplace_code = body.get('marketplaceCode') or body.get('warehouse_code')
+        company_name_raw = body.get('companyName')
+        company_name = normalize_company_name(company_name_raw) if company_name_raw else None
+
+        if not marketplace_code:
+            return JsonResponse({
+                'success': False,
+                'error': 'marketplaceCode (or warehouse_code) is required',
+                'valid_marketplaces': list(MARKETPLACE_IDS.keys()),
+            }, status=400)
+
+        if marketplace_code not in MARKETPLACE_IDS:
+            return JsonResponse({
+                'success': False,
+                'error': f'Invalid marketplaceCode: {marketplace_code}',
+                'valid_marketplaces': list(MARKETPLACE_IDS.keys()),
+            }, status=400)
+
+        marketplace_id = MARKETPLACE_IDS[marketplace_code]
+
+        # ── Resolve credential group via active companies (RDX INC LTD, brandsinn) ──
+        region = self.get_region_from_marketplace(marketplace_id)
+        try:
+            group = find_credential_group_for_marketplace(marketplace_id, company_name)
+        except KeyError:
+            return JsonResponse({
+                'success': False,
+                'error': f'No active credential group found for marketplace "{marketplace_code}"',
+                'active_companies': ACTIVE_COMPANIES,
+            }, status=400)
+        creds = CREDENTIALS[group]
+        try:
             access_token = self._get_access_token(creds)
         except Exception as e:
-            return JsonResponse({'success': False, 'error': str(e)}, status=500)
+            return JsonResponse({'success': False, 'error': f'Authentication failed: {e}'}, status=500)
 
-        # Optional marketplace code to pick region (defaults to EU)
-        marketplace_code = request.GET.get('marketplace') or request.GET.get('marketplaceCode')
-        if marketplace_code and marketplace_code in MARKETPLACE_IDS:
-            marketplace_id = MARKETPLACE_IDS[marketplace_code]
-            region = self.get_region_from_marketplace(marketplace_id)
-        else:
-            region = 'eu'
-
+        # ── Cancel the schedule ───────────────────────────────────────────────
         url = f"https://sellingpartnerapi-{region}.amazon.com/reports/2021-06-30/schedules/{report_schedule_id}"
         headers = {
             'x-amz-access-token': access_token,
             'accept': 'application/json',
             'User-Agent': 'AmazonConnector/1.0'
         }
-
         try:
             resp = requests.delete(url, headers=headers, timeout=30)
-            # SP-API often returns 204 No Content on success
             if resp.status_code in (200, 202, 204):
                 return JsonResponse({
                     'success': True,
                     'reportScheduleId': report_schedule_id,
+                    'marketplaceCode': marketplace_code,
+                    'company': company_name,
+                    'credential_group': group,
                     'status_code': resp.status_code,
                     'processing_time_seconds': round(time.time() - start_time, 2)
                 })
-            # Treat other codes as error
             return JsonResponse({
                 'success': False,
                 'reportScheduleId': report_schedule_id,
@@ -963,7 +1101,8 @@ class CancelReportScheduleView(View):
                 'success': False,
                 'reportScheduleId': report_schedule_id,
                 'error': str(e),
-                'response': getattr(e, 'response', None).text if getattr(e, 'response', None) is not None else None
+                'response': e.response.text if getattr(e, 'response', None) is not None else None,
             }, status=500)
+
 
 

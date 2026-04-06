@@ -17,20 +17,29 @@ def save_inventory_report_to_mssql(csv_path: str, latest_report: dict, marketpla
     data_end = latest_report.get('dataEndTime')
 
     with engine.begin() as conn:
-        # Run INSERT IF NOT EXISTS as one statement
+        # Wipe all existing data for this marketplace (child first due to FK)
         conn.execute(
-            text(
-                """
-                IF NOT EXISTS (SELECT 1 FROM dbo.Report WHERE report_id = :report_id)
-                BEGIN
-                    INSERT INTO dbo.Report (
-                        report_id, report_type, marketplace, dataStartTime, dataEndTime, created_time, items_count
-                    ) VALUES (
-                        :report_id, :report_type, :marketplace, :dataStartTime, :dataEndTime, :created_time, :items_count
-                    );
-                END
-                """
-            ),
+            text("""
+                DELETE cr FROM dbo.FBA_Inventory_Report cr
+                INNER JOIN dbo.Report r ON cr.r_id = r.ID
+                WHERE r.marketplace = :marketplace
+            """),
+            {'marketplace': marketplace_code}
+        )
+        conn.execute(
+            text("DELETE FROM dbo.Report WHERE marketplace = :marketplace"),
+            {'marketplace': marketplace_code}
+        )
+
+        # Insert fresh Report row for today
+        conn.execute(
+            text("""
+                INSERT INTO dbo.Report (
+                    report_id, report_type, marketplace, dataStartTime, dataEndTime, created_time, items_count
+                ) VALUES (
+                    :report_id, :report_type, :marketplace, :dataStartTime, :dataEndTime, :created_time, :items_count
+                )
+            """),
             {
                 'report_id': report_id,
                 'report_type': report_type,
@@ -42,14 +51,13 @@ def save_inventory_report_to_mssql(csv_path: str, latest_report: dict, marketpla
             }
         )
 
-        # Then select the ID in a separate execute to avoid closed result errors
         row = conn.execute(
-            text("SELECT ID FROM dbo.Report WHERE report_id = :report_id"),
-            { 'report_id': report_id }
+            text("SELECT ID FROM dbo.Report WHERE report_id = :report_id AND marketplace = :marketplace"),
+            { 'report_id': report_id, 'marketplace': marketplace_code }
         ).fetchone()
 
         if not row:
-            raise RuntimeError('Failed to obtain Report.ID after insert/select')
+            raise RuntimeError('Failed to obtain Report.ID after insert')
         r_id = int(row[0])
 
     # Load the CSV and map to your FBA_Inventory_Report schema

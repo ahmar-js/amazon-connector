@@ -1315,6 +1315,7 @@ class FetchAmazonDataView(View):
             max_orders = data.get('max_orders')
             auto_save = data.get('auto_save', False)  # Get auto_save parameter
             data_type = data.get('data_type', None)  # Get data_type parameter for SCM
+            dates_in_utc = data.get('dates_in_utc', False)  # Skip local→UTC conversion when True (used by Celery tasks)
             company_name = (data.get('company_name') or DEFAULT_COMPANY_NAME).strip()
             logger.info(f"🔍 Start date: {start_date}, End date: {end_date}")
             logger.info(f"🔍 data_type: {data_type}")
@@ -1340,19 +1341,25 @@ class FetchAmazonDataView(View):
                 # start_dt = datetime.fromisoformat(start_date.replace('Z', ''))
                 # end_dt = datetime.fromisoformat(end_date.replace('Z', ''))
                 # logger.info(f"🔍 Start date: {start_dt}, End date: {end_dt}")
-                # Convert input dates from marketplace local time to UTC
-                # UK -> Europe/London (BST/GMT); US/CA -> America/Los_Angeles (PST/PDT); Others -> Europe/Paris (MET/CET)
-                if marketplace_id == "A1F83G8C2ARO7P":  # UK
-                    tz_market = "UK"
-                elif marketplace_id in ("ATVPDKIKX0DER", "A2EUQ1WTGCTBG2"):  # US or CA
-                    tz_market = "US"  # treat US/CA as Pacific Time
+                if dates_in_utc:
+                    # Dates are already in UTC (e.g. from Celery tasks) — skip local→UTC conversion
+                    start_dt = datetime.fromisoformat(start_date.replace('Z', ''))
+                    end_dt = datetime.fromisoformat(end_date.replace('Z', ''))
+                    logger.info(f"🔍 Dates already in UTC — Start: {start_dt}, End: {end_dt}")
                 else:
-                    tz_market = "IT"  # any EU marketplace; handled as Europe/Paris
-                start_dt_str, end_dt_str = self.convert_dates(start_date, end_date, tz_market)
-                # Convert result back to datetime
-                start_dt = datetime.fromisoformat(start_dt_str.replace('Z', ''))
-                end_dt = datetime.fromisoformat(end_dt_str.replace('Z', ''))
-                logger.info(f"🔍 Start date: {start_dt}, End date: {end_dt}")
+                    # Convert input dates from marketplace local time to UTC
+                    # UK -> Europe/London (BST/GMT); US/CA -> America/Los_Angeles (PST/PDT); Others -> Europe/Paris (MET/CET)
+                    if marketplace_id == "A1F83G8C2ARO7P":  # UK
+                        tz_market = "UK"
+                    elif marketplace_id in ("ATVPDKIKX0DER", "A2EUQ1WTGCTBG2"):  # US or CA
+                        tz_market = "US"  # treat US/CA as Pacific Time
+                    else:
+                        tz_market = "IT"  # any EU marketplace; handled as Europe/Paris
+                    start_dt_str, end_dt_str = self.convert_dates(start_date, end_date, tz_market)
+                    # Convert result back to datetime
+                    start_dt = datetime.fromisoformat(start_dt_str.replace('Z', ''))
+                    end_dt = datetime.fromisoformat(end_dt_str.replace('Z', ''))
+                    logger.info(f"🔍 Start date: {start_dt}, End date: {end_dt}")
 
             except ValueError as e:
                 return JsonResponse({
