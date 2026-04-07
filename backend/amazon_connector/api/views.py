@@ -1955,6 +1955,10 @@ class FetchAmazonDataView(View):
                 
                 order_items = items_result['items']
                 failed_orders = items_result.get('failed_orders', [])
+                
+                # Save any remaining failed order IDs to a .txt file per region
+                if failed_orders:
+                    self._save_failed_order_ids_to_file(failed_orders, marketplace_id)
             else:
                 logger.info(f"ℹ️  No new orders to fetch items for (all are duplicates)")
                 order_items = {}
@@ -3018,7 +3022,48 @@ class FetchAmazonDataView(View):
         else:
             hours = estimated_minutes / 60
             return f"{hours:.1f} hours"
-    
+
+    def _save_failed_order_ids_to_file(self, failed_orders: List[Dict], marketplace_id: str) -> None:
+        """
+        Save failed order IDs to a .txt file per region after all auto-retry attempts.
+
+        Args:
+            failed_orders (List[Dict]): List of failed order dicts with 'order_id' keys
+            marketplace_id (str): Amazon marketplace ID
+        """
+        _marketplace_names = {
+            "ATVPDKIKX0DER": "USA",
+            "A2EUQ1WTGCTBG2": "CA",
+            "A1F83G8C2ARO7P": "UK",
+            "A1PA6795UKMFR9": "DE",
+            "A13V1IB3VIYZZH": "FR",
+            "APJ6JRA9NG5V4": "IT",
+            "A1RKKUPIHCS9HS": "ES",
+        }
+        region = _marketplace_names.get(marketplace_id, marketplace_id)
+
+        try:
+            failed_orders_dir = Path(settings.BASE_DIR) / 'failed_orders'
+            failed_orders_dir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_path = failed_orders_dir / f"{region}_failed_orders_{timestamp}.txt"
+
+            order_ids = [f.get('order_id', str(f)) for f in failed_orders]
+
+            with open(file_path, 'w') as fh:
+                fh.write(f"# Failed Order IDs for region: {region}\n")
+                fh.write(f"# Generated: {datetime.utcnow().isoformat()}Z\n")
+                fh.write(f"# Total failed: {len(order_ids)}\n")
+                fh.write("#" + "=" * 50 + "\n")
+                for order_id in order_ids:
+                    fh.write(f"{order_id}\n")
+
+            logger.warning(f"💾 Saved {len(order_ids)} failed order IDs to: {file_path}")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to save failed order IDs to file: {e}")
+
     def fetch_single_order_items(self, headers: Dict[str, str], base_url: str, order: Dict) -> Dict:
         """
         Fetch items for a single order.
