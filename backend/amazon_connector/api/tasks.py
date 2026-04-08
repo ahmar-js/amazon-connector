@@ -363,9 +363,7 @@ def process_marketplaces(self):
         # Back off a bit, then try again
         raise self.retry(exc=exc, countdown=120, max_retries=10)
 
-def _fixed_ranges_config() -> dict[str, list[tuple[str, str]]]:
-    pass
-    #USA: ATVPDKIKX
+
 
 # ============================================================================
 # MISSING ORDERS FETCH FOR USA MARKETPLACE

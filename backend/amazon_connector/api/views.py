@@ -1538,7 +1538,7 @@ class FetchAmazonDataView(View):
                             if data_type == 'scm_data':
                                 # SCM-specific save: Only save to SCM tables
                                 logger.info("📦 SCM data type detected - saving to SCM tables only...")
-                                db_save_result = save_scm_data(mssql_df, azure_df, marketplace_id)
+                                db_save_result = save_scm_data(mssql_df, azure_df, marketplace_id, company_name=company_name)
                             else:
                                 # Standard save: Save to amazon_api_* and stg_tr_amazon_raw tables
                                 db_save_result = save_simple(mssql_df, azure_df, marketplace_id)
@@ -4782,3 +4782,570 @@ class FetchMissingOrdersView(View):
         updated_headers["x-amz-access-token"] = new_access_token
         updated_headers["x-amz-date"] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
         return updated_headers
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class FetchOrdersByIdView(View):
+    """
+    Fetch orders by their Amazon Order IDs, process them, and save to database.
+    
+    This endpoint accepts a list of order IDs, a marketplace name (e.g. "US", "UK"),
+    and a company name. It resolves credentials automatically using the marketplace
+    credentials configuration, fetches order details and order items from Amazon SP-API,
+    processes the data through the same pipeline as FetchAmazonDataView, and saves
+    the results to MSSQL and Azure databases.
+    
+    Uses the Amazon SP-API v0 Orders endpoint (v0 response format is required by
+    the process_amazon_data pipeline):
+        GET /orders/v0/orders/{orderId}
+        GET /orders/v0/orders/{orderId}/orderItems
+    
+    Note: For US/CA marketplaces, the company_name is automatically resolved to
+    'brandsinn' because the CA_USA_GROUP credentials belong to the brandsinn seller account.
+    """
+    
+    # Amazon SP-API base URLs per marketplace
+    SP_API_BASE_URLS = {
+        "ATVPDKIKX0DER": "https://sellingpartnerapi-na.amazon.com",   # US
+        "A2EUQ1WTGCTBG2": "https://sellingpartnerapi-na.amazon.com",  # CA
+        "A1F83G8C2ARO7P": "https://sellingpartnerapi-eu.amazon.com",  # UK
+        "A1PA6795UKMFR9": "https://sellingpartnerapi-eu.amazon.com",  # DE
+        "A13V1IB3VIYZZH": "https://sellingpartnerapi-eu.amazon.com",  # FR
+        "APJ6JRA9NG5V4": "https://sellingpartnerapi-eu.amazon.com",   # IT
+        "A1RKKUPIHCS9HS": "https://sellingpartnerapi-eu.amazon.com",  # ES
+    }
+    
+    # Marketplace name -> ID mapping
+    MARKETPLACE_NAME_TO_ID = {
+        "US": "ATVPDKIKX0DER",
+        "USA": "ATVPDKIKX0DER",
+        "CA": "A2EUQ1WTGCTBG2",
+        "UK": "A1F83G8C2ARO7P",
+        "DE": "A1PA6795UKMFR9",
+        "FR": "A13V1IB3VIYZZH",
+        "IT": "APJ6JRA9NG5V4",
+        "ES": "A1RKKUPIHCS9HS",
+    }
+    
+    # Orders API version path — v0 is required because the data processing pipeline
+    # (process_amazon_data / save_simple) expects v0 response field names
+    # (AmazonOrderId, PurchaseDate, OrderStatus, etc.).
+    # The v2026-01-01 endpoint returns a completely different response schema.
+    ORDERS_API_VERSION = "/orders/v0"
+    
+    # Rate limits (conservative single-order approach)
+    ORDER_FETCH_DELAY = 2       # seconds between getOrder calls
+    ORDER_ITEMS_FETCH_DELAY = 2  # seconds between getOrderItems calls
+    MAX_RETRIES = 3
+    REQUEST_TIMEOUT = 60
+
+    def post(self, request):
+        """
+        Fetch orders by their Amazon Order IDs (read from CSV) and save to SCM tables.
+        
+        Expected request parameters:
+        - marketplace_name: Marketplace short name (e.g. "US", "UK", "CA", "IT", "DE", "FR", "ES")
+        - company_name: Company name for credential lookup and data processing
+        - auto_save: Boolean to auto-save to database (default: True)
+        
+        Order IDs are read from the CSV file at:
+        api/filtered_miss.csv  (column: amazon-order-id)
+        
+        Returns:
+            JsonResponse: Contains fetched data, processing results, and save status
+        """
+        logger.info("=" * 80)
+        logger.info("🚀 FetchOrdersByIdView.post() - START")
+        logger.info("=" * 80)
+        
+        activity = None
+        
+        try:
+            # ── Step 1: Parse request ──
+            try:
+                data = json.loads(request.body)
+            except json.JSONDecodeError as e:
+                return create_error_response(
+                    ErrorType.VALIDATION_ERROR, 'Invalid JSON',
+                    f'Could not parse request body: {str(e)}', 400
+                )
+            
+            # ── Step 2: Validate required fields ──
+            required_fields = ['marketplace_name', 'company_name']
+            missing_fields = [f for f in required_fields if not data.get(f)]
+            if missing_fields:
+                return create_error_response(
+                    ErrorType.VALIDATION_ERROR, 'Missing required fields',
+                    f'Required: {", ".join(missing_fields)}', 400
+                )
+            
+            marketplace_name = data['marketplace_name'].strip().upper()
+            company_name = data['company_name'].strip()
+            auto_save = data.get('auto_save', True)
+            
+            # ── Step 3: Read order IDs from CSV ──
+            import pandas as pd
+            csv_path = Path(settings.BASE_DIR) / 'api' / 'filtered_miss.csv'
+            if not csv_path.exists():
+                return create_error_response(
+                    ErrorType.VALIDATION_ERROR, 'CSV file not found',
+                    f'Expected CSV at: {csv_path}', 400
+                )
+            try:
+                csv_df = pd.read_csv(csv_path, dtype=str)
+                if 'amazon-order-id' not in csv_df.columns:
+                    return create_error_response(
+                        ErrorType.VALIDATION_ERROR, 'Invalid CSV format',
+                        f'CSV must have an "amazon-order-id" column. Found: {list(csv_df.columns)}', 400
+                    )
+                order_ids = csv_df['amazon-order-id'].dropna().str.strip().tolist()
+                order_ids = [oid for oid in order_ids if oid]
+            except Exception as csv_err:
+                return create_error_response(
+                    ErrorType.VALIDATION_ERROR, 'Failed to read CSV',
+                    str(csv_err), 400
+                )
+            
+            if not order_ids:
+                return create_error_response(
+                    ErrorType.VALIDATION_ERROR, 'No order IDs found',
+                    'The CSV file contains no valid order IDs', 400
+                )
+            
+            logger.info(f"📄 Read {len(order_ids)} order IDs from CSV: {csv_path}")
+            
+            # ── Step 4: Resolve marketplace ID ──
+            marketplace_id = self.MARKETPLACE_NAME_TO_ID.get(marketplace_name)
+            if not marketplace_id:
+                return create_error_response(
+                    ErrorType.VALIDATION_ERROR, 'Invalid marketplace_name',
+                    f'Supported values: {", ".join(sorted(self.MARKETPLACE_NAME_TO_ID.keys()))}', 400
+                )
+            base_url = self.SP_API_BASE_URLS[marketplace_id]
+            
+            logger.info(f"📦 Order IDs: {len(order_ids)} | Marketplace: {marketplace_name} ({marketplace_id}) | Company: {company_name}")
+            
+            # ── Step 5: Resolve credentials & obtain access token ──
+            from .marketplaces_creds import (
+                get_credentials_for_marketplace, normalize_company_name,
+                BRANDSINN_COMPANY_NAME,
+            )
+            
+            resolved_company = normalize_company_name(company_name)
+            
+            # CA & USA group credentials always belong to brandsinn seller account
+            if marketplace_name in ('US', 'USA', 'CA'):
+                resolved_company = BRANDSINN_COMPANY_NAME
+                logger.info(f"🔄 US/CA marketplace — company auto-resolved to '{resolved_company}'")
+            try:
+                creds = get_credentials_for_marketplace(marketplace_id, resolved_company)
+            except KeyError as e:
+                return create_error_response(
+                    ErrorType.VALIDATION_ERROR, 'Credential lookup failed',
+                    f'No credentials configured for company "{resolved_company}" / marketplace "{marketplace_name}": {e}', 400
+                )
+            
+            token_result = self._get_access_token(creds)
+            if not token_result['success']:
+                return create_error_response(
+                    ErrorType.AUTHENTICATION_ERROR, 'Token refresh failed',
+                    token_result.get('details', 'Could not obtain access token'), 401
+                )
+            
+            access_token = token_result['access_token']
+            headers = {
+                "x-amz-access-token": access_token,
+                "Content-Type": "application/json",
+                "x-amz-date": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                "User-Agent": "AmazonConnector/1.0",
+            }
+            
+            # ── Step 6: Create activity record ──
+            today = datetime.utcnow().date()
+            try:
+                activity = Activities.objects.create(
+                    company_name=resolved_company,
+                    marketplace_id=marketplace_id,
+                    activity_type='orders',
+                    status='in_progress',
+                    action='manual',
+                    date_from=today,
+                    date_to=today,
+                    detail=f'Fetching {len(order_ids)} orders by ID for {resolved_company}/{marketplace_name}'
+                )
+                logger.info(f"📝 Activity created: {activity.activity_id}")
+            except Exception as act_err:
+                logger.warning(f"⚠️ Could not create activity record: {act_err}")
+            
+            # ── Step 7: Process in batches of 100 ──
+            BATCH_SIZE = 100
+            total_batches = (len(order_ids) + BATCH_SIZE - 1) // BATCH_SIZE
+            
+            fetch_start = time.time()
+            
+            # Accumulators across all batches
+            all_orders = []
+            all_order_items = []
+            all_failed = []
+            all_db_save_results = []
+            total_records_saved = 0
+            total_processing_duration = 0
+            
+            for batch_num in range(total_batches):
+                batch_start_idx = batch_num * BATCH_SIZE
+                batch_end_idx = min(batch_start_idx + BATCH_SIZE, len(order_ids))
+                batch_ids = order_ids[batch_start_idx:batch_end_idx]
+                
+                logger.info("=" * 60)
+                logger.info(f"📦 Batch {batch_num + 1}/{total_batches} — {len(batch_ids)} order IDs (index {batch_start_idx}-{batch_end_idx - 1})")
+                logger.info("=" * 60)
+                
+                # 7a: Fetch orders for this batch
+                orders_result = self._fetch_orders_by_ids(headers, base_url, batch_ids)
+                orders = orders_result['orders']
+                failed_order_ids_batch = orders_result['failed_order_ids']
+                all_failed.extend(failed_order_ids_batch)
+                
+                if not orders:
+                    logger.warning(f"⚠️ Batch {batch_num + 1}: No orders fetched — all {len(batch_ids)} failed")
+                    continue
+                
+                all_orders.extend(orders)
+                logger.info(f"✅ Batch {batch_num + 1}: Fetched {len(orders)}/{len(batch_ids)} orders")
+                
+                # 7b: Fetch order items for this batch
+                items_result = self._fetch_items_for_orders(headers, base_url, orders)
+                order_items_dict = items_result['items']
+                items_failed_batch = items_result['failed_orders']
+                all_failed.extend(items_failed_batch)
+                
+                # Flatten order items
+                batch_order_items = []
+                for order in orders:
+                    oid = order['AmazonOrderId']
+                    items = order_items_dict.get(oid, [])
+                    for item in items:
+                        item['order_id'] = oid
+                        batch_order_items.append(item)
+                
+                all_order_items.extend(batch_order_items)
+                logger.info(f"✅ Batch {batch_num + 1}: Fetched {len(batch_order_items)} items")
+                
+                # 7c: Process & save this batch
+                try:
+                    proc_start = time.time()
+                    mssql_df, azure_df = process_amazon_data(orders, batch_order_items, marketplace_name, resolved_company)
+                    proc_dur = time.time() - proc_start
+                    total_processing_duration += proc_dur
+                    logger.info(f"✅ Batch {batch_num + 1}: Processing done in {proc_dur:.2f}s — MSSQL: {mssql_df.shape}, Azure: {azure_df.shape}")
+                    
+                    if auto_save:
+                        save_start = time.time()
+                        db_save_result = save_scm_data(mssql_df, azure_df, marketplace_id, company_name=resolved_company)
+                        save_dur = time.time() - save_start
+                        all_db_save_results.append(db_save_result)
+                        batch_saved = db_save_result.get('total_records_saved', 0)
+                        total_records_saved += batch_saved
+                        
+                        if db_save_result['success']:
+                            logger.info(f"✅ Batch {batch_num + 1}: SCM save done in {save_dur:.2f}s — {batch_saved} records")
+                        else:
+                            logger.error(f"❌ Batch {batch_num + 1}: SCM save failed: {db_save_result.get('errors', [])}")
+                except Exception as proc_err:
+                    logger.error(f"❌ Batch {batch_num + 1}: Processing/save error: {proc_err}", exc_info=True)
+                    all_db_save_results.append({'success': False, 'error': str(proc_err), 'total_records_saved': 0})
+            
+            # ── Step 8: Save all failed IDs to file ──
+            all_failed = list(set(all_failed))
+            if all_failed:
+                self._save_failed_order_ids_to_file(all_failed, marketplace_id)
+            
+            # ── Step 9: Update activity ──
+            total_duration = time.time() - fetch_start
+            any_save_success = any(r.get('success', False) for r in all_db_save_results)
+            if activity:
+                try:
+                    activity.status = 'completed'
+                    activity.orders_fetched = len(all_orders)
+                    activity.items_fetched = len(all_order_items)
+                    activity.duration_seconds = total_duration
+                    
+                    parts = [
+                        f'Fetched {len(all_orders)}/{len(order_ids)} orders in {total_batches} batches',
+                        f'{len(all_order_items)} items in {total_duration:.1f}s',
+                    ]
+                    if auto_save:
+                        activity.database_saved = any_save_success
+                        parts.append(f"Saved {total_records_saved} records to SCM tables")
+                    if all_failed:
+                        parts.append(f"{len(all_failed)} orders failed")
+                    activity.detail = ' | '.join(parts)
+                    activity.save()
+                except Exception as upd_err:
+                    logger.warning(f"⚠️ Failed to update activity: {upd_err}")
+            
+            # ── Step 10: Build response ──
+            response_data = {
+                'success': True,
+                'message': f'Fetched {len(all_orders)}/{len(order_ids)} orders in {total_batches} batches',
+                'data': {
+                    'metadata': {
+                        'fetched_at': datetime.utcnow().isoformat() + 'Z',
+                        'total_orders': len(all_orders),
+                        'total_items': len(all_order_items),
+                        'marketplace': marketplace_name,
+                        'marketplace_id': marketplace_id,
+                        'company_name': resolved_company,
+                        'total_batches': total_batches,
+                        'batch_size': BATCH_SIZE,
+                        'processing_duration_seconds': round(total_processing_duration, 2),
+                        'total_duration_seconds': round(total_duration, 2),
+                    },
+                },
+                'statistics': {
+                    'requested': len(order_ids),
+                    'fetched_orders': len(all_orders),
+                    'fetched_items': len(all_order_items),
+                    'total_records_saved': total_records_saved,
+                    'failed_order_ids': all_failed,
+                    'failed_count': len(all_failed),
+                },
+            }
+            
+            logger.info(f"✅ FetchOrdersByIdView completed — {len(all_orders)}/{len(order_ids)} orders, {total_batches} batches, {total_duration:.2f}s")
+            return JsonResponse(response_data)
+        
+        except Exception as e:
+            logger.error(f"❌ Unexpected error in FetchOrdersByIdView: {e}", exc_info=True)
+            if activity:
+                try:
+                    activity.status = 'failed'
+                    activity.error_message = str(e)[:500]
+                    activity.save()
+                except Exception:
+                    pass
+            return JsonResponse({
+                'success': False,
+                'error': 'Unexpected error occurred',
+                'details': str(e),
+            }, status=500)
+    
+    # ─── Helper methods ───────────────────────────────────────────────────
+    
+    def _get_access_token(self, creds: dict) -> Dict:
+        """Obtain an access token by refreshing using the given credentials."""
+        try:
+            response = requests.post(
+                'https://api.amazon.com/auth/o2/token',
+                data={
+                    'grant_type': 'refresh_token',
+                    'refresh_token': creds['refresh_token'],
+                    'client_id': creds['app_id'],
+                    'client_secret': creds['client_secret'],
+                },
+                headers={
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'User-Agent': 'AmazonConnector/1.0',
+                },
+                timeout=30,
+            )
+            if response.status_code == 200:
+                token_info = response.json()
+                logger.info("✅ Access token obtained successfully")
+                return {'success': True, 'access_token': token_info['access_token']}
+            else:
+                try:
+                    err = response.json().get('error_description', response.text[:200])
+                except Exception:
+                    err = response.text[:200]
+                logger.error(f"❌ Token refresh failed: HTTP {response.status_code} — {err}")
+                return {'success': False, 'details': err}
+        except Exception as e:
+            logger.error(f"❌ Token refresh exception: {e}")
+            return {'success': False, 'details': str(e)}
+    
+    def _fetch_orders_by_ids(self, headers: Dict[str, str], base_url: str, order_ids: List[str]) -> Dict:
+        """
+        Fetch individual orders using the v0 Orders API.
+        Includes retry with exponential backoff and 429 handling.
+        """
+        orders = []
+        failed_order_ids = []
+        
+        for idx, order_id in enumerate(order_ids, 1):
+            if idx > 1:
+                time.sleep(self.ORDER_FETCH_DELAY)
+            
+            url = f"{base_url}{self.ORDERS_API_VERSION}/orders/{order_id}"
+            logger.info(f"🔍 [{idx}/{len(order_ids)}] Fetching order: {order_id}")
+            logger.info(f"   URL: {url}")
+            
+            success = False
+            for attempt in range(self.MAX_RETRIES):
+                try:
+                    resp = requests.get(url, headers=headers, timeout=self.REQUEST_TIMEOUT)
+                    logger.info(f"   Response status: {resp.status_code}")
+                    
+                    if resp.status_code == 200:
+                        resp_json = resp.json()
+                        order = resp_json.get('payload')
+                        if order:
+                            orders.append(order)
+                            logger.info(f"   ✅ Order fetched — Status: {order.get('OrderStatus', 'N/A')}, Date: {order.get('PurchaseDate', 'N/A')}")
+                        else:
+                            logger.warning(f"   ⚠️ No 'payload' key in response. Keys: {list(resp_json.keys())}")
+                            logger.warning(f"   Response preview: {json.dumps(resp_json, default=str)[:500]}")
+                            failed_order_ids.append(order_id)
+                        success = True
+                        break
+                    
+                    elif resp.status_code == 429:
+                        retry_after = int(resp.headers.get('x-amzn-RateLimit-Limit', 60))
+                        wait = max(retry_after, 30) * (attempt + 1)
+                        logger.warning(f"   ⚠️ 429 Rate limited — waiting {wait}s (attempt {attempt + 1})")
+                        time.sleep(wait)
+                        continue
+                    
+                    elif resp.status_code == 403:
+                        logger.error(f"   ❌ 403 Forbidden for order {order_id}")
+                        failed_order_ids.append(order_id)
+                        success = True  # Don't retry auth errors
+                        break
+                    
+                    elif resp.status_code == 404:
+                        logger.warning(f"   ⚠️ 404 Order not found: {order_id}")
+                        failed_order_ids.append(order_id)
+                        success = True  # Don't retry 404s
+                        break
+                    
+                    else:
+                        logger.error(f"   ❌ HTTP {resp.status_code} for order {order_id}")
+                        if attempt == self.MAX_RETRIES - 1:
+                            failed_order_ids.append(order_id)
+                        else:
+                            time.sleep(5 * (attempt + 1))
+                
+                except requests.exceptions.Timeout:
+                    logger.error(f"   ❌ Timeout (attempt {attempt + 1})")
+                    if attempt == self.MAX_RETRIES - 1:
+                        failed_order_ids.append(order_id)
+                    else:
+                        time.sleep(5 * (attempt + 1))
+                except Exception as e:
+                    logger.error(f"   ❌ Error: {e} (attempt {attempt + 1})")
+                    if attempt == self.MAX_RETRIES - 1:
+                        failed_order_ids.append(order_id)
+                    else:
+                        time.sleep(5 * (attempt + 1))
+        
+        logger.info(f"📊 Orders fetch: {len(orders)} success, {len(failed_order_ids)} failed")
+        return {'orders': orders, 'failed_order_ids': failed_order_ids}
+    
+    def _fetch_items_for_orders(self, headers: Dict[str, str], base_url: str, orders: List[Dict]) -> Dict:
+        """
+        Fetch order items using the v0 Orders API.
+        Includes retry with exponential backoff and 429 handling.
+        """
+        all_items = {}
+        failed_orders = []
+        
+        for idx, order in enumerate(orders, 1):
+            order_id = order['AmazonOrderId']
+            if idx > 1:
+                time.sleep(self.ORDER_ITEMS_FETCH_DELAY)
+            
+            url = f"{base_url}{self.ORDERS_API_VERSION}/orders/{order_id}/orderItems"
+            logger.info(f"🔍 [{idx}/{len(orders)}] Fetching items for: {order_id}")
+            
+            fetched = False
+            for attempt in range(self.MAX_RETRIES):
+                try:
+                    resp = requests.get(url, headers=headers, timeout=self.REQUEST_TIMEOUT)
+                    
+                    if resp.status_code == 200:
+                        items = resp.json().get('payload', {}).get('OrderItems', [])
+                        all_items[order_id] = items
+                        logger.info(f"   ✅ {len(items)} items fetched")
+                        fetched = True
+                        break
+                    
+                    elif resp.status_code == 429:
+                        wait = max(int(resp.headers.get('x-amzn-RateLimit-Limit', 30)), 15) * (attempt + 1)
+                        logger.warning(f"   ⚠️ 429 Rate limited — waiting {wait}s (attempt {attempt + 1})")
+                        time.sleep(wait)
+                        continue
+                    
+                    else:
+                        logger.error(f"   ❌ HTTP {resp.status_code}")
+                        if attempt == self.MAX_RETRIES - 1:
+                            all_items[order_id] = []
+                            failed_orders.append(order_id)
+                        else:
+                            time.sleep(5 * (attempt + 1))
+                
+                except requests.exceptions.Timeout:
+                    logger.error(f"   ❌ Timeout (attempt {attempt + 1})")
+                    if attempt == self.MAX_RETRIES - 1:
+                        all_items[order_id] = []
+                        failed_orders.append(order_id)
+                    else:
+                        time.sleep(5 * (attempt + 1))
+                except Exception as e:
+                    logger.error(f"   ❌ Error: {e} (attempt {attempt + 1})")
+                    if attempt == self.MAX_RETRIES - 1:
+                        all_items[order_id] = []
+                        failed_orders.append(order_id)
+                    else:
+                        time.sleep(5 * (attempt + 1))
+        
+        total_items = sum(len(v) for v in all_items.values())
+        logger.info(f"📊 Items fetch: {len(all_items) - len(failed_orders)} success, {len(failed_orders)} failed, {total_items} total items")
+        return {'items': all_items, 'failed_orders': failed_orders}
+    
+    def _save_failed_order_ids_to_file(self, failed_order_ids: List[str], marketplace_id: str) -> None:
+        """Save failed order IDs to a .txt file per region."""
+        _marketplace_names = {
+            "ATVPDKIKX0DER": "USA",
+            "A2EUQ1WTGCTBG2": "CA",
+            "A1F83G8C2ARO7P": "UK",
+            "A1PA6795UKMFR9": "DE",
+            "A13V1IB3VIYZZH": "FR",
+            "APJ6JRA9NG5V4": "IT",
+            "A1RKKUPIHCS9HS": "ES",
+        }
+        region = _marketplace_names.get(marketplace_id, marketplace_id)
+        try:
+            failed_dir = Path(settings.BASE_DIR) / 'failed_orders'
+            failed_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_path = failed_dir / f"{region}_failed_orders_{timestamp}.txt"
+            with open(file_path, 'w') as fh:
+                fh.write(f"# Failed Order IDs for region: {region}\n")
+                fh.write(f"# Generated: {datetime.utcnow().isoformat()}Z\n")
+                fh.write(f"# Total failed: {len(failed_order_ids)}\n")
+                fh.write("#" + "=" * 50 + "\n")
+                for oid in failed_order_ids:
+                    fh.write(f"{oid}\n")
+            logger.warning(f"💾 Saved {len(failed_order_ids)} failed order IDs to: {file_path}")
+        except Exception as e:
+            logger.error(f"❌ Failed to save failed order IDs to file: {e}")
+    
+    def get(self, request):
+        """Handle GET requests with API documentation."""
+        return JsonResponse({
+            'message': 'Fetch Orders By ID API',
+            'methods': ['POST'],
+            'required_fields': ['marketplace_name', 'company_name'],
+            'optional_fields': ['auto_save (default: true)'],
+            'description': 'Reads order IDs from api/filtered_miss.csv (column: amazon-order-id), '
+                           'fetches orders from Amazon SP-API, processes and saves to SCM tables. '
+                           'Credentials are resolved automatically from company + marketplace.',
+            'csv_path': 'api/filtered_miss.csv',
+            'csv_column': 'amazon-order-id',
+            'example': {
+                'marketplace_name': 'US',
+                'company_name': 'B2Fitinss',
+                'auto_save': True,
+            },
+            'supported_marketplaces': ['US', 'USA', 'CA', 'UK', 'DE', 'FR', 'IT', 'ES'],
+        })

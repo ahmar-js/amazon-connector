@@ -115,7 +115,7 @@ def create_Azure_db_connection():
               echo=False)
 
 
-def save_scm_data(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: str) -> Dict:
+def save_scm_data(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id: str, company_name: str = None) -> Dict:
     """
     Save SCM-specific data to MSSQL tables.
     
@@ -153,7 +153,8 @@ def save_scm_data(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id
         'OrderStatus',
         'FulfillmentChannel',
         'SellerSKU',
-        'QuantityOrdered'
+        'QuantityOrdered',
+        'Company',
     ]
     
     # Columns for scm_amazon_orders table (from azure_df/merged_df3)
@@ -163,6 +164,7 @@ def save_scm_data(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id
         'OrderId',
         'SKU',
         'Type',
+        'Company',
         'Region',
         'Quantity',
         'FulfillmentChannel'
@@ -175,6 +177,17 @@ def save_scm_data(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id
         'total_records_saved': 0,
         'errors': []
     }
+    
+    # Inject Company column if not already present in DataFrames
+    if company_name:
+        if 'Company' not in mssql_df.columns:
+            mssql_df = mssql_df.copy()
+            mssql_df['Company'] = company_name
+            logger.info(f"📝 Added Company='{company_name}' to mssql_df")
+        if 'Company' not in azure_df.columns:
+            azure_df = azure_df.copy()
+            azure_df['Company'] = company_name
+            logger.info(f"📝 Added Company='{company_name}' to azure_df")
     
     try:
         MSSQL_engine = create_mssql_connection()
