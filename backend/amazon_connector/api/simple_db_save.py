@@ -139,6 +139,7 @@ def save_scm_data(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id
         'A1F83G8C2ARO7P': 'scm_sku_mapper_uk',  # United Kingdom
         'ATVPDKIKX0DER': 'scm_sku_mapper_usa',  # United States
         'A2EUQ1WTGCTBG2': 'scm_sku_mapper_ca',  # Canada
+        'A13V1IB3VIYZZH': 'scm_sku_mapper_fr',  # France
     }
     
     # Columns for scm_sku_mapper tables (from mssql_df/merged_df2)
