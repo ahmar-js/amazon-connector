@@ -627,12 +627,13 @@ class AmazonDataProcessor:
 
         return df
 
-    def _add_region_mapping(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _add_region_mapping(self, df: pd.DataFrame, marketplace_name: str = '') -> pd.DataFrame:
         """
         Add region mapping efficiently using vectorized operations.
         
         Args:
             df: Input DataFrame
+            marketplace_name: Marketplace code (e.g., 'UK', 'US') used as fallback Region
             
         Returns:
             DataFrame with region information
@@ -648,6 +649,22 @@ class AmazonDataProcessor:
             df.loc[mask, 'Region'] = info['region']
             df.loc[mask, 'Country'] = info['country']
             df.loc[mask, 'Company'] = self._resolve_company_for_channel(marketplace, info['company'])
+        
+        # Fallback: for rows where Region is still empty (e.g. Non-Amazon SalesChannel),
+        # use marketplace_name as the Region and resolve Country/Company from it
+        empty_mask = df['Region'] == ''
+        if empty_mask.any() and marketplace_name:
+            region_to_info = {info['region']: info for info in self.MARKETPLACE_REGIONS.values()}
+            if marketplace_name.upper() in region_to_info:
+                info = region_to_info[marketplace_name.upper()]
+                df.loc[empty_mask, 'Region'] = info['region']
+                df.loc[empty_mask, 'Country'] = info['country']
+                df.loc[empty_mask, 'Company'] = self._resolve_company_for_channel(
+                    [k for k, v in self.MARKETPLACE_REGIONS.items() if v['region'] == info['region']][0],
+                    info['company']
+                )
+            else:
+                df.loc[empty_mask, 'Region'] = marketplace_name.upper()
         
         return df
     
@@ -1046,7 +1063,7 @@ class AmazonDataProcessor:
             merged_df = self._calculate_vat_vectorized(merged_df)
             
             # 7. Add region mapping
-            merged_df = self._add_region_mapping(merged_df)
+            merged_df = self._add_region_mapping(merged_df, marketplace_name)
             
             # 8. Create MSSQL DataFrame
             merged_df2 = self._create_mssql_dataframe(merged_df)
