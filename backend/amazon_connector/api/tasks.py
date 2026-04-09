@@ -1,5 +1,6 @@
 # api/tasks.py
 from datetime import timedelta, datetime, time
+import time as time_mod
 from celery import shared_task
 from celery import group, chain
 from celery.exceptions import Retry
@@ -637,21 +638,119 @@ def reset_usa_missing_orders_progress() -> dict:
 @shared_task(bind=True, queue='reports')
 def generate_reports(self):
     """
-    Asynchronous task to generate reports
-    """
-    try:
-        print("Generating reports...")
-        marketplaces = ['IT']
-        payload = {
-            "marketplaces": marketplaces,
-        }
-        response = requests.post("http://127.0.0.1:8000/api/inventory/reports/", json=payload)
-        logger.info(f"API Response ({response.status_code})")
+    Scheduled task: fetch and save inventory reports for ALL marketplaces.
+    Runs daily at 10:15 AM PKT (05:15 UTC).
 
-        
+    For each marketplace it:
+      1. Creates an InventoryReportLog row (status=in_progress)
+      2. POSTs to the internal inventory API
+      3. Parses the JSON response and updates the log row
+    All marketplace rows in the same invocation share one run_id.
+    """
+    import uuid as _uuid
+    from .models import InventoryReportLog
+    from .marketplaces import MARKETPLACE_IDS
+
+    ALL_MARKETPLACES = ["IT", "FR", "UK", "ES", "US", "CA", "DE"]
+    run_id = _uuid.uuid4()
+    run_start = timezone.now()
+    report_date = (run_start.astimezone(timezone.utc) - timedelta(days=1)).date()
+
+    logger.info(
+        f"[generate_reports] Starting inventory report run {run_id} for {len(ALL_MARKETPLACES)} marketplaces, "
+        f"report_date={report_date}"
+    )
+
+    summary = {"success": 0, "failed": 0, "details": {}}
+
+    # Create pending log rows up-front so we have visibility even if the task crashes
+    log_rows = {}
+    for code in ALL_MARKETPLACES:
+        log = InventoryReportLog.objects.create(
+            run_id=run_id,
+            marketplace_code=code,
+            marketplace_id=MARKETPLACE_IDS.get(code, ''),
+            report_date=report_date,
+            status='in_progress',
+            triggered_by='schedule',
+        )
+        log_rows[code] = log
+
+    # Single API call with all marketplaces
+    payload = {"warehouse_codes": ALL_MARKETPLACES}
+    mp_start = time_mod.time()
+    try:
+        response = requests.post(
+            "http://127.0.0.1:8000/api/inventory/reports/",
+            json=payload,
+            timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
+        )
+        duration = round(time_mod.time() - mp_start, 2)
+        logger.info(f"[generate_reports] API responded {response.status_code} in {duration}s")
+
+        if 200 <= response.status_code < 300:
+            body = response.json()
+            results = body.get("results", {})
+
+            for code in ALL_MARKETPLACES:
+                log = log_rows[code]
+                mp_result = results.get(code, {})
+
+                log.credential_group = mp_result.get("credential_group", "")
+                log.report_id = mp_result.get("report_id", "")
+                log.items_count = mp_result.get("items_count", 0)
+                log.file_path = mp_result.get("file_path", "")
+                log.mssql_saved = mp_result.get("mssql_save", {}).get("success", False) if isinstance(mp_result.get("mssql_save"), dict) else False
+                log.azure_saved = mp_result.get("azure_save", {}).get("success", False) if isinstance(mp_result.get("azure_save"), dict) else False
+                log.duration_seconds = duration
+
+                if mp_result.get("success"):
+                    log.status = "completed"
+                    summary["success"] += 1
+                else:
+                    log.status = "failed"
+                    log.error_message = mp_result.get("error", "Unknown error from API")
+                    summary["failed"] += 1
+
+                log.save()
+                summary["details"][code] = log.status
+        else:
+            # Whole API call failed — mark every marketplace as failed
+            error_text = response.text[:1000]
+            for code in ALL_MARKETPLACES:
+                log = log_rows[code]
+                log.status = "failed"
+                log.error_message = f"HTTP {response.status_code}: {error_text}"
+                log.duration_seconds = duration
+                log.save()
+                summary["failed"] += 1
+                summary["details"][code] = "failed"
+
     except Exception as exc:
-        logger.error(f"Report generation task failed: {exc}")
-        raise self.retry(exc=exc, countdown=60, max_retries=3)
+        duration = round(time_mod.time() - mp_start, 2)
+        logger.error(f"[generate_reports] Exception during API call: {exc}")
+        for code in ALL_MARKETPLACES:
+            log = log_rows[code]
+            log.status = "failed"
+            log.error_message = str(exc)[:2000]
+            log.duration_seconds = duration
+            log.save()
+            summary["failed"] += 1
+            summary["details"][code] = "failed"
+        raise self.retry(exc=exc, countdown=300, max_retries=2)
+
+    total_duration = round((timezone.now() - run_start).total_seconds(), 2)
+    logger.info(
+        f"[generate_reports] Run {run_id} finished in {total_duration}s — "
+        f"success={summary['success']}, failed={summary['failed']}"
+    )
+
+    return {
+        "run_id": str(run_id),
+        "report_date": str(report_date),
+        "total_duration_seconds": total_duration,
+        **summary,
+    }
 
 @shared_task(bind=True, queue='fetching_scm')
 def fetch_scm_data(self):

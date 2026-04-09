@@ -282,3 +282,104 @@ class SCMLastRun(models.Model):
     def save(self, *args, **kwargs):
         self.marketplace_name = resolve_marketplace_name(self.marketplace_id)
         super().save(*args, **kwargs)
+
+
+class InventoryReportLog(models.Model):
+    """
+    Tracks each scheduled inventory report run with per-marketplace detail.
+    One row per marketplace per run.
+    """
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('in_progress', 'In Progress'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+    ]
+
+    # Run-level identifier: all marketplaces in the same scheduled run share this
+    run_id = models.UUIDField(
+        default=uuid.uuid4,
+        db_index=True,
+        help_text="Groups all marketplace results belonging to the same scheduled run"
+    )
+
+    # Marketplace detail
+    marketplace_code = models.CharField(
+        max_length=10,
+        help_text="Short marketplace code, e.g. UK, US, IT"
+    )
+    marketplace_id = models.CharField(
+        max_length=255,
+        blank=True,
+        default='',
+        help_text="Amazon marketplace ID"
+    )
+    marketplace_name = models.CharField(
+        max_length=100,
+        blank=True,
+        default='',
+        help_text="Human-readable marketplace name"
+    )
+    credential_group = models.CharField(
+        max_length=100,
+        blank=True,
+        default='',
+        help_text="Credential group used for authentication"
+    )
+
+    # Report detail
+    report_id = models.CharField(
+        max_length=255,
+        blank=True,
+        default='',
+        help_text="Amazon report ID fetched"
+    )
+    report_date = models.DateField(
+        help_text="The date the inventory report covers (typically yesterday)"
+    )
+    items_count = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of inventory items in the report"
+    )
+    file_path = models.CharField(
+        max_length=500,
+        blank=True,
+        default='',
+        help_text="Local file path where the report CSV was saved"
+    )
+
+    # Database save tracking
+    mssql_saved = models.BooleanField(default=False)
+    azure_saved = models.BooleanField(default=False)
+
+    # Status & timing
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='pending'
+    )
+    error_message = models.TextField(blank=True, default='')
+    duration_seconds = models.FloatField(null=True, blank=True)
+    triggered_by = models.CharField(
+        max_length=20,
+        default='schedule',
+        help_text="How the run was triggered: schedule, manual"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'inventory_report_log'
+        verbose_name = 'Inventory Report Log'
+        verbose_name_plural = 'Inventory Report Logs'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['run_id']),
+            models.Index(fields=['marketplace_code', '-created_at']),
+            models.Index(fields=['status', '-created_at']),
+            models.Index(fields=['report_date']),
+        ]
+
+    def __str__(self):
+        return f"{self.marketplace_code} | {self.report_date} | {self.status}"
