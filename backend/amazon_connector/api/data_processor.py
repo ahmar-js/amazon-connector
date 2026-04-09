@@ -907,12 +907,18 @@ class AmazonDataProcessor:
         merged_df3 = merged_df3.rename(columns={'PurchaseDate': 'data_fetch_Date'})
         
         # Add grand total
-        df4 = df[['OrderId', 'grand_total']].drop_duplicates()
-        merged_df3 = pd.merge(merged_df3, df4, on='OrderId', how='left')
+        if 'grand_total' in df.columns:
+            df4 = df[['OrderId', 'grand_total']].drop_duplicates()
+            merged_df3 = pd.merge(merged_df3, df4, on='OrderId', how='left')
+        else:
+            merged_df3['grand_total'] = 0.0
         
         # Add title
-        df5 = df[['SKU', 'Title']].drop_duplicates(subset='SKU', keep='last')
-        merged_df3 = pd.merge(merged_df3, df5, on='SKU', how='left')
+        if 'Title' in df.columns:
+            df5 = df[['SKU', 'Title']].drop_duplicates(subset='SKU', keep='last')
+            merged_df3 = pd.merge(merged_df3, df5, on='SKU', how='left')
+        else:
+            merged_df3['Title'] = None
         
         # Calculate per-unit prices
         if 'Quantity' in merged_df3.columns and merged_df3['Quantity'].sum() > 0:
