@@ -214,8 +214,9 @@ def fetch_orders_for_marketplace(self, marketplace_id: str, start_iso: str, end_
         )
 
         if 200 <= response.status_code < 300:
-            # Persist last_run as end of the day, only if still expected (avoid racing duplicates)
-            end_dt = _parse_iso_utc(end_iso)
+            # Persist last_run as the fetched day (start_dt), only if still expected (avoid racing duplicates)
+            # We store start_dt (midnight of the fetched day) so that _day_window_after
+            # correctly computes start_dt.date() + 1 day as the next window.
             with transaction.atomic():
                 obj = MarketplaceLastRun.objects.select_for_update().get(
                     marketplace_id=marketplace_id,
@@ -227,9 +228,9 @@ def fetch_orders_for_marketplace(self, marketplace_id: str, start_iso: str, end_
                         f"[fetch_orders_for_marketplace] Not updating last_run for {marketplace_id}/{resolved_company}: window already advanced elsewhere"
                     )
                 else:
-                    obj.last_run = end_dt
+                    obj.last_run = start_dt
                     obj.save(update_fields=["last_run"])
-            logger.info(f"[fetch_orders_for_marketplace] Updated last_run for {marketplace_id}/{resolved_company} -> {end_iso}")
+            logger.info(f"[fetch_orders_for_marketplace] Updated last_run for {marketplace_id}/{resolved_company} -> {start_iso}")
             return {
                 "marketplace_id": marketplace_id,
                 "company_name": resolved_company,
@@ -864,7 +865,6 @@ def fetch_scm_for_marketplace(self, marketplace_id: str, start_iso: str, end_iso
                 logger.info(
                     f"[fetch_scm_for_marketplace] No orders for {marketplace_id} on this day. Marking as complete."
                 )
-                end_dt = _parse_iso_utc(end_iso)
                 with transaction.atomic():
                     obj = SCMLastRun.objects.select_for_update().get(
                         marketplace_id=marketplace_id,
@@ -872,9 +872,9 @@ def fetch_scm_for_marketplace(self, marketplace_id: str, start_iso: str, end_iso
                     )
                     curr_expected_start, _ = _scm_day_window_after(obj.last_run)
                     if curr_expected_start == start_dt:
-                        obj.last_run = end_dt
+                        obj.last_run = start_dt
                         obj.save(update_fields=["last_run", "updated_at"])
-                        logger.info(f"[fetch_scm_for_marketplace] Updated SCM last_run for {resolved_company}/{marketplace_id} -> {end_iso} (no orders)")
+                        logger.info(f"[fetch_scm_for_marketplace] Updated SCM last_run for {resolved_company}/{marketplace_id} -> {start_iso} (no orders)")
                 return {
                     "marketplace_id": marketplace_id, 
                     "company_name": resolved_company,
@@ -901,7 +901,6 @@ def fetch_scm_for_marketplace(self, marketplace_id: str, start_iso: str, end_iso
                 }
             
             # Case 3: Orders fetched and saved successfully - update last_run
-            end_dt = _parse_iso_utc(end_iso)
             with transaction.atomic():
                 obj = SCMLastRun.objects.select_for_update().get(
                     marketplace_id=marketplace_id,
@@ -913,9 +912,9 @@ def fetch_scm_for_marketplace(self, marketplace_id: str, start_iso: str, end_iso
                         f"[fetch_scm_for_marketplace] Not updating last_run for {resolved_company}/{marketplace_id}: window already advanced elsewhere"
                     )
                 else:
-                    obj.last_run = end_dt
+                    obj.last_run = start_dt
                     obj.save(update_fields=["last_run", "updated_at"])
-            logger.info(f"[fetch_scm_for_marketplace] Updated SCM last_run for {resolved_company}/{marketplace_id} -> {end_iso} ({records_saved} records saved)")
+            logger.info(f"[fetch_scm_for_marketplace] Updated SCM last_run for {resolved_company}/{marketplace_id} -> {start_iso} ({records_saved} records saved)")
             return {
                 "marketplace_id": marketplace_id,
                 "company_name": resolved_company,
