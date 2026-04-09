@@ -1335,7 +1335,10 @@ class FetchAmazonDataView(View):
                 if 'T' not in start_date:
                     start_date = f"{start_date}T00:00:00Z"
                 if 'T' not in end_date:
-                    end_date = f"{end_date}T23:59:59Z"
+                    # Use next-day midnight as exclusive upper bound to avoid missing
+                    # orders at the day boundary (e.g. 23:59:59Z)
+                    end_date_next = (datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+                    end_date = f"{end_date_next}T00:00:00Z"
                 logger.info(f"🔍 Start date: {start_date}, End date: {end_date}")
                 
                 # start_dt = datetime.fromisoformat(start_date.replace('Z', ''))

@@ -138,15 +138,16 @@ def _parse_iso_utc(value: str) -> datetime:
 
 def _day_window_after(last_run: datetime | None) -> tuple[datetime, datetime]:
     """
-    Given last_run, compute the next day's [start, end] window in UTC.
+    Given last_run, compute the next day's [start, end) window in UTC.
     If last_run is None, use SEED_START_LAST_RUN and return the following day's window.
     Returns (start_dt, end_dt) both aware UTC datetimes.
+    end_dt is midnight of the day AFTER, used as exclusive upper bound (CreatedBefore).
     """
     lr = _parse_last_run(last_run) or SEED_START_LAST_RUN
     # Next day
     next_day_date = (lr.astimezone(timezone.utc).date() + timedelta(days=1))
     start_dt = timezone.datetime.combine(next_day_date, time(0, 0, 0, tzinfo=timezone.utc))
-    end_dt = timezone.datetime.combine(next_day_date, time(23, 59, 59, tzinfo=timezone.utc))
+    end_dt = timezone.datetime.combine(next_day_date + timedelta(days=1), time(0, 0, 0, tzinfo=timezone.utc))
     return start_dt, end_dt
 
 def _within_end_date(start_dt: datetime) -> bool:
@@ -671,15 +672,16 @@ SCM_SEED_START_LAST_RUN = timezone.datetime(2025, 12, 31, 23, 59, 59, tzinfo=tim
 
 def _scm_day_window_after(last_run: datetime | None) -> tuple[datetime, datetime]:
     """
-    Given last_run, compute the next day's [start, end] window in UTC for SCM.
+    Given last_run, compute the next day's [start, end) window in UTC for SCM.
     If last_run is None, use SCM_SEED_START_LAST_RUN and return Jan 1, 2026.
     Returns (start_dt, end_dt) both aware UTC datetimes.
+    end_dt is midnight of the day AFTER, used as exclusive upper bound (CreatedBefore).
     """
     lr = _parse_last_run(last_run) or SCM_SEED_START_LAST_RUN
     # Next day
     next_day_date = (lr.astimezone(timezone.utc).date() + timedelta(days=1))
     start_dt = timezone.datetime.combine(next_day_date, time(0, 0, 0, tzinfo=timezone.utc))
-    end_dt = timezone.datetime.combine(next_day_date, time(23, 59, 59, tzinfo=timezone.utc))
+    end_dt = timezone.datetime.combine(next_day_date + timedelta(days=1), time(0, 0, 0, tzinfo=timezone.utc))
     return start_dt, end_dt
 
 
