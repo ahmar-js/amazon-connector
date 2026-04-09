@@ -169,6 +169,7 @@ def save_scm_data(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id
         'Region',
         'Quantity',
         'FulfillmentChannel'
+        'data_fetch_Date'
     ]
     
     results = {
