@@ -618,12 +618,14 @@ class AmazonDataProcessor:
                 df.loc[zero_promo_mask, 'Price'] - df.loc[zero_promo_mask, 'ItemTax.Amount']
             )
 
-        # Round results
+        # Round results (only columns that actually exist)
         calc_columns = [
             'ItemTax.Amount', 'Promotional_Tax', 'Price',
             'unit_price(vat_exclusive)', 'item_total'
         ]
-        df[calc_columns] = df[calc_columns].round(2)
+        existing_calc = [col for col in calc_columns if col in df.columns]
+        if existing_calc:
+            df[existing_calc] = df[existing_calc].round(2)
 
         return df
 
