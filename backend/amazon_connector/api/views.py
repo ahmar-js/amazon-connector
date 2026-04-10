@@ -2049,7 +2049,7 @@ class FetchAmazonDataView(View):
                     'MarketplaceIds': marketplace_id,
                     'CreatedAfter': start_date,
                     'CreatedBefore': end_date,
-                    'OrderStatuses': 'Shipped,Unshipped,PartiallyShipped,Canceled,Unfulfillable',
+                    'OrderStatuses': 'Shipped,Unshipped,PartiallyShipped,Canceled,Unfulfillable,Pending',
                     'MaxResultsPerPage': page_sizes[0]  # Try largest first
                 }
                 
