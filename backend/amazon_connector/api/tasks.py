@@ -32,10 +32,14 @@ from .job_locks import (
     clear_job_stop_request,
     get_job_lock,
     is_lock_active,
+    is_protected_ingestion_window,
     release_job_lock,
     request_job_stop,
 )
-from .scm_reconciliation import run_scm_order_reconciliation
+from .scm_reconciliation import (
+    backfill_reconciliation_queue_from_scm_sources,
+    run_scm_order_reconciliation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1220,6 +1224,46 @@ def reconcile_scm_order_statuses(self):
         raise
     except Exception as exc:
         logger.error(f"[reconcile_scm_order_statuses] Reconciliation error: {exc}", exc_info=True)
+        raise self.retry(exc=exc, countdown=300, max_retries=2)
+
+
+@shared_task(bind=True, queue='fetching_scm', soft_time_limit=3900, time_limit=4200)
+def backfill_scm_order_reconciliation_queue(
+    self,
+    days: int = 45,
+    marketplace_code: str | None = None,
+    company_name: str | None = None,
+    limit_per_table: int = 5000,
+):
+    """
+    One-time/manual backfill from existing scm_sku_mapper_* rows into the
+    reconciliation queue. This does not call Amazon and does not write
+    scm_amazon_orders; it only creates resumable queue state for old non-final
+    rows that were saved before queueing existed.
+    """
+    try:
+        if is_protected_ingestion_window(log_result=True):
+            logger.info("[backfill_scm_order_reconciliation_queue] Protected ingestion window active; skipping backfill")
+            return {"status": "skipped", "reason": "protected_window"}
+
+        lock = get_job_lock(AMAZON_ORDERS_LOCK_NAME)
+        if lock and lock.stop_requested:
+            logger.info("[backfill_scm_order_reconciliation_queue] Stop requested; skipping backfill")
+            return {"status": "skipped", "reason": "stop_requested"}
+        if is_lock_active(lock) and lock.locked_by == LOCK_OWNER_MAIN_INGESTION:
+            logger.info("[backfill_scm_order_reconciliation_queue] Main ingestion is running; skipping backfill")
+            return {"status": "skipped", "reason": "main_ingestion_running"}
+
+        return backfill_reconciliation_queue_from_scm_sources(
+            days=days,
+            marketplace_code=marketplace_code,
+            company_name=company_name,
+            limit_per_table=limit_per_table,
+        )
+    except Retry:
+        raise
+    except Exception as exc:
+        logger.error(f"[backfill_scm_order_reconciliation_queue] Backfill error: {exc}", exc_info=True)
         raise self.retry(exc=exc, countdown=300, max_retries=2)
 
 

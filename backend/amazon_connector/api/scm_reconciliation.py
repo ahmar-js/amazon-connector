@@ -10,7 +10,7 @@ import requests
 from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from .data_processor import process_amazon_data
 from .job_locks import (
@@ -46,6 +46,7 @@ MAX_RECONCILIATION_RUNTIME_MINUTES = 60
 MAX_RECONCILIATION_ROWS_PER_RUN = 500
 MAX_RECONCILIATION_ROWS_PER_MARKETPLACE = 100
 MAX_RECONCILIATION_BATCH_SIZE = 50
+MAX_RECONCILIATION_BACKFILL_ROWS_PER_TABLE = 5000
 
 ORDER_LOOKUP_DELAY_SECONDS = 2
 ORDER_ITEMS_LOOKUP_DELAY_SECONDS = 2
@@ -211,6 +212,198 @@ def _validated_source_table(marketplace_id: str, source_table: str) -> Optional[
         expected,
     )
     return None
+
+
+def _get_mssql_table_columns(conn, source_table: str) -> set:
+    rows = conn.execute(
+        text(
+            """
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = :table_name
+            """
+        ),
+        {"table_name": source_table},
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+def _build_backfill_query(source_table: str, selected_columns: List[str], limit_per_table: int):
+    safe_table = f"[{source_table}]"
+    columns_sql = ", ".join(f"[{column}]" for column in selected_columns)
+    purchase_expr = "TRY_CONVERT(datetime2, REPLACE(REPLACE([PurchaseDate], 'T', ' '), 'Z', ''))"
+    query = text(
+        f"""
+        SELECT TOP {int(limit_per_table)} {columns_sql}
+        FROM {safe_table}
+        WHERE [OrderStatus] IN :statuses
+          AND [AmazonOrderId] IS NOT NULL
+          AND [PurchaseDate] IS NOT NULL
+          AND {purchase_expr} >= :start_utc
+          AND {purchase_expr} < :cutoff_utc
+        ORDER BY {purchase_expr} ASC
+        """
+    )
+    return query.bindparams(bindparam("statuses", expanding=True))
+
+
+def backfill_reconciliation_queue_from_scm_sources(
+    days: int = 45,
+    marketplace_code: Optional[str] = None,
+    company_name: Optional[str] = None,
+    limit_per_table: int = MAX_RECONCILIATION_BACKFILL_ROWS_PER_TABLE,
+) -> Dict:
+    """
+    Backfill reconciliation queue rows from existing scm_sku_mapper_* MSSQL tables.
+
+    This is idempotent and only queues non-final rows older than the current PKT
+    business day. It does not call Amazon and does not write scm_amazon_orders.
+    """
+    if days <= 0:
+        raise ValueError("days must be greater than 0")
+    if limit_per_table <= 0:
+        raise ValueError("limit_per_table must be greater than 0")
+
+    now = timezone.now()
+    cutoff_utc = _business_today_start_utc(now)
+    start_utc = cutoff_utc - timedelta(days=days)
+    requested_marketplace_code = marketplace_code.upper().strip() if marketplace_code else None
+    selected_statuses = sorted(CHANGEABLE_ORDER_STATUSES)
+
+    summary = {
+        "status": "completed",
+        "days": days,
+        "marketplace_code": requested_marketplace_code,
+        "company_name": company_name,
+        "limit_per_table": limit_per_table,
+        "start_utc": start_utc.isoformat(),
+        "cutoff_utc": cutoff_utc.isoformat(),
+        "tables_scanned": 0,
+        "source_rows": 0,
+        "inserted": 0,
+        "updated": 0,
+        "skipped_final": 0,
+        "skipped_current_day": 0,
+        "skipped_existing_final": 0,
+        "skipped_invalid": 0,
+        "errors": [],
+    }
+
+    if requested_marketplace_code and requested_marketplace_code not in MARKETPLACE_CODE_TO_ID:
+        raise ValueError(f"Unsupported marketplace_code: {requested_marketplace_code}")
+
+    from .simple_db_save import create_mssql_connection
+
+    engine = create_mssql_connection()
+    with engine.connect() as conn:
+        for current_marketplace_id, source_table in SCM_SKU_MAPPER_TABLE_MAPPING.items():
+            current_marketplace_code = _marketplace_code_for_id(current_marketplace_id)
+            if requested_marketplace_code and current_marketplace_code != requested_marketplace_code:
+                continue
+
+            expected_table = _validated_source_table(current_marketplace_id, source_table)
+            if expected_table is None:
+                summary["errors"].append(f"invalid_source_table:{source_table}")
+                continue
+
+            try:
+                available_columns = _get_mssql_table_columns(conn, expected_table)
+                required_columns = ["PurchaseDate", "AmazonOrderId", "OrderStatus"]
+                if any(column not in available_columns for column in required_columns):
+                    missing = [column for column in required_columns if column not in available_columns]
+                    message = f"{expected_table}: missing required columns {missing}"
+                    logger.error("[scm_reconciliation] Backfill skipped table=%s missing=%s", expected_table, missing)
+                    summary["errors"].append(message)
+                    continue
+
+                candidate_columns = [
+                    "PurchaseDate",
+                    "PurchaseDate_conversion",
+                    "AmazonOrderId",
+                    "ASIN",
+                    "Title",
+                    "SalesChannel",
+                    "Region",
+                    "OrderStatus",
+                    "FulfillmentChannel",
+                    "SellerSKU",
+                    "QuantityOrdered",
+                    "Company",
+                    "LastUpdateDate",
+                ]
+                selected_columns = [column for column in candidate_columns if column in available_columns]
+                query = _build_backfill_query(expected_table, selected_columns, limit_per_table)
+                params = {
+                    "statuses": selected_statuses,
+                    "start_utc": start_utc.replace(tzinfo=None),
+                    "cutoff_utc": cutoff_utc.replace(tzinfo=None),
+                }
+                logger.info(
+                    "[scm_reconciliation] Backfill scanning table=%s marketplace=%s days=%s limit=%s",
+                    expected_table,
+                    current_marketplace_code,
+                    days,
+                    limit_per_table,
+                )
+                result = conn.execute(query, params)
+                rows = result.fetchall()
+                df = pd.DataFrame(rows, columns=result.keys())
+                summary["tables_scanned"] += 1
+                summary["source_rows"] += len(df)
+
+                if df.empty:
+                    logger.info("[scm_reconciliation] Backfill found no rows table=%s", expected_table)
+                    continue
+
+                if company_name:
+                    if "Company" not in df.columns:
+                        logger.warning(
+                            "[scm_reconciliation] Backfill company filter requested but table has no Company column table=%s",
+                            expected_table,
+                        )
+                        df = df.iloc[0:0]
+                    else:
+                        df = df[df["Company"].fillna("").astype(str).str.strip() == normalize_company_name(company_name)]
+
+                if df.empty:
+                    logger.info("[scm_reconciliation] Backfill found no rows after company filter table=%s", expected_table)
+                    continue
+
+                if "Company" in df.columns:
+                    grouped = df.groupby(df["Company"].fillna("").astype(str).str.strip(), dropna=False)
+                    for row_company, company_df in grouped:
+                        resolved_company = normalize_company_name(row_company or company_name)
+                        queue_result = upsert_non_final_orders_to_reconciliation_queue(
+                            company_df,
+                            marketplace_id=current_marketplace_id,
+                            source_table=expected_table,
+                            company_name=resolved_company,
+                        )
+                        for key in ("inserted", "updated", "skipped_final", "skipped_current_day", "skipped_existing_final", "skipped_invalid"):
+                            summary[key] += queue_result.get(key, 0)
+                else:
+                    queue_result = upsert_non_final_orders_to_reconciliation_queue(
+                        df,
+                        marketplace_id=current_marketplace_id,
+                        source_table=expected_table,
+                        company_name=company_name,
+                    )
+                    for key in ("inserted", "updated", "skipped_final", "skipped_current_day", "skipped_existing_final", "skipped_invalid"):
+                        summary[key] += queue_result.get(key, 0)
+
+            except Exception as exc:
+                logger.error(
+                    "[scm_reconciliation] Backfill failed table=%s error=%s",
+                    expected_table,
+                    exc,
+                    exc_info=True,
+                )
+                summary["errors"].append(f"{expected_table}: {exc}")
+
+    if summary["errors"]:
+        summary["status"] = "partial_success"
+    logger.info("[scm_reconciliation] Backfill finished summary=%s", summary)
+    return summary
 
 
 def upsert_non_final_orders_to_reconciliation_queue(
