@@ -176,6 +176,7 @@ def save_scm_data(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id
         'success': True,
         'scm_sku_mapper_result': None,
         'scm_amazon_orders_result': None,
+        'reconciliation_queue_result': None,
         'total_records_saved': 0,
         'errors': []
     }
@@ -240,6 +241,25 @@ def save_scm_data(mssql_df: pd.DataFrame, azure_df: pd.DataFrame, marketplace_id
                         'table_name': sku_mapper_table
                     }
                     results['total_records_saved'] += len(scm_sku_df)
+                    try:
+                        from .scm_reconciliation import upsert_non_final_orders_to_reconciliation_queue
+
+                        queue_result = upsert_non_final_orders_to_reconciliation_queue(
+                            scm_sku_df,
+                            marketplace_id=marketplace_id,
+                            source_table=sku_mapper_table,
+                            company_name=company_name,
+                        )
+                        results['reconciliation_queue_result'] = queue_result
+                        logger.info(f"SCM reconciliation queue upsert result: {queue_result}")
+                    except Exception as queue_error:
+                        # Queueing is best-effort so reconciliation metadata issues do not
+                        # block the critical main ingestion cursor.
+                        logger.error(f"SCM reconciliation queue upsert failed: {queue_error}", exc_info=True)
+                        results['reconciliation_queue_result'] = {
+                            'success': False,
+                            'error': str(queue_error),
+                        }
                     logger.info(f"✅ SCM SKU Mapper save successful: {len(scm_sku_df)} records to {sku_mapper_table}")
                 else:
                     logger.warning(f"SCM SKU Mapper: No valid columns found in mssql_df")

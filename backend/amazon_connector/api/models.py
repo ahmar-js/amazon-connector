@@ -284,6 +284,71 @@ class SCMLastRun(models.Model):
         super().save(*args, **kwargs)
 
 
+class SCMJobLock(models.Model):
+    """Database-backed lock/control row for SCM order jobs."""
+    job_name = models.CharField(max_length=100, primary_key=True)
+    locked_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    locked_by = models.CharField(max_length=100, null=True, blank=True)
+    stop_requested = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'scm_job_locks'
+        verbose_name = 'SCM Job Lock'
+        verbose_name_plural = 'SCM Job Locks'
+        indexes = [
+            models.Index(fields=['expires_at']),
+        ]
+
+    def __str__(self):
+        owner = self.locked_by or 'unlocked'
+        return f"{self.job_name} - {owner}"
+
+
+class SCMOrderReconciliationQueue(models.Model):
+    """Queue of non-final SCM Amazon orders that need later status checks."""
+    company_name = models.CharField(max_length=100, default='B2Fitinss')
+    marketplace_code = models.CharField(max_length=10)
+    marketplace_id = models.CharField(max_length=255, default='')
+    source_table = models.CharField(max_length=100)
+    amazon_order_id = models.CharField(max_length=255)
+    seller_sku = models.CharField(max_length=255, blank=True, default='')
+    asin = models.CharField(max_length=255, blank=True, default='')
+    current_status = models.CharField(max_length=100)
+    purchase_date = models.DateTimeField(null=True, blank=True)
+    last_update_date = models.DateTimeField(null=True, blank=True)
+    next_check_at = models.DateTimeField()
+    check_count = models.PositiveIntegerField(default=0)
+    is_final = models.BooleanField(default=False)
+    final_status = models.CharField(max_length=100, null=True, blank=True)
+    last_checked_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'scm_order_reconciliation_queue'
+        verbose_name = 'SCM Order Reconciliation Queue'
+        verbose_name_plural = 'SCM Order Reconciliation Queue'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['company_name', 'marketplace_code', 'amazon_order_id', 'seller_sku', 'asin'],
+                name='unique_scm_reconciliation_order_item',
+            )
+        ]
+        indexes = [
+            models.Index(fields=['is_final', 'next_check_at']),
+            models.Index(fields=['marketplace_code', 'is_final', 'next_check_at']),
+            models.Index(fields=['company_name', 'marketplace_code', 'amazon_order_id']),
+            models.Index(fields=['purchase_date']),
+        ]
+
+    def __str__(self):
+        return f"{self.company_name}/{self.marketplace_code}/{self.amazon_order_id}/{self.seller_sku}"
+
+
 class InventoryReportLog(models.Model):
     """
     Tracks each scheduled inventory report run with per-marketplace detail.

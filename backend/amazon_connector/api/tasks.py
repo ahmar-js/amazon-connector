@@ -21,6 +21,21 @@ from .marketplaces_creds import (
     get_credential_group_for_marketplace,
     normalize_company_name,
 )
+from .job_locks import (
+    AMAZON_ORDERS_LOCK_NAME,
+    LOCK_OWNER_MAIN_INGESTION,
+    LOCK_OWNER_STATUS_SYNC,
+    MAIN_INGESTION_LOCK_EXPIRES_MINUTES,
+    MAIN_INGESTION_LOCK_POLL_SECONDS,
+    MAIN_INGESTION_LOCK_WAIT_SECONDS,
+    acquire_job_lock,
+    clear_job_stop_request,
+    get_job_lock,
+    is_lock_active,
+    release_job_lock,
+    request_job_stop,
+)
+from .scm_reconciliation import run_scm_order_reconciliation
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +114,99 @@ HTTP_READ_TIMEOUT = int(os.getenv("FETCH_READ_TIMEOUT", "14400"))  # 4 hours
 MARKETPLACE_FETCH_DELAY = int(os.getenv("MARKETPLACE_FETCH_DELAY", "120"))  # 90 seconds
 # Delay for same credential group (marketplaces sharing credentials)
 SAME_CREDENTIAL_GROUP_DELAY = int(os.getenv("SAME_CREDENTIAL_GROUP_DELAY", "60"))  # 1 minute 
+
+
+def _acquire_main_ingestion_orders_lock(context: str) -> tuple[bool, str | None]:
+    """
+    Acquire the global Amazon orders lock for the critical SCM ingestion path.
+
+    The main job has priority over future status-sync work: when status_sync owns
+    the lock, main_ingestion requests a cooperative stop, waits briefly, and then
+    fails loudly instead of silently skipping.
+    """
+    existing_lock = get_job_lock(AMAZON_ORDERS_LOCK_NAME)
+    if is_lock_active(existing_lock) and existing_lock.locked_by == LOCK_OWNER_STATUS_SYNC:
+        request_job_stop(AMAZON_ORDERS_LOCK_NAME)
+
+    deadline = time_mod.monotonic() + MAIN_INGESTION_LOCK_WAIT_SECONDS
+
+    while True:
+        result = acquire_job_lock(
+            AMAZON_ORDERS_LOCK_NAME,
+            locked_by=LOCK_OWNER_MAIN_INGESTION,
+            expires_minutes=MAIN_INGESTION_LOCK_EXPIRES_MINUTES,
+        )
+
+        if result.acquired:
+            logger.info(
+                "[%s] Acquired global Amazon orders lock: job_name=%s",
+                context,
+                AMAZON_ORDERS_LOCK_NAME,
+            )
+            return True, None
+
+        owner = result.locked_by
+        expires_at = result.expires_at
+
+        if owner == LOCK_OWNER_MAIN_INGESTION:
+            logger.warning(
+                "[%s] Duplicate main ingestion detected; lock already held by main_ingestion until %s. Skipping this duplicate trigger.",
+                context,
+                expires_at,
+            )
+            return False, "duplicate_main_ingestion"
+
+        if owner == LOCK_OWNER_STATUS_SYNC:
+            request_job_stop(AMAZON_ORDERS_LOCK_NAME)
+            remaining = deadline - time_mod.monotonic()
+            if remaining <= 0:
+                message = (
+                    f"[{context}] CRITICAL: main_ingestion could not acquire "
+                    f"{AMAZON_ORDERS_LOCK_NAME} after {MAIN_INGESTION_LOCK_WAIT_SECONDS}s; "
+                    f"status_sync still holds lock until {expires_at}"
+                )
+                logger.critical(message)
+                raise RuntimeError(message)
+
+            sleep_for = min(MAIN_INGESTION_LOCK_POLL_SECONDS, remaining)
+            logger.warning(
+                "[%s] Waiting %.0fs for status_sync to release global Amazon orders lock; expires_at=%s",
+                context,
+                sleep_for,
+                expires_at,
+            )
+            time_mod.sleep(sleep_for)
+            continue
+
+        remaining = deadline - time_mod.monotonic()
+        if remaining <= 0:
+            message = (
+                f"[{context}] CRITICAL: main_ingestion could not acquire "
+                f"{AMAZON_ORDERS_LOCK_NAME} after {MAIN_INGESTION_LOCK_WAIT_SECONDS}s; "
+                f"current_owner={owner} expires_at={expires_at}"
+            )
+            logger.critical(message)
+            raise RuntimeError(message)
+
+        sleep_for = min(MAIN_INGESTION_LOCK_POLL_SECONDS, remaining)
+        logger.warning(
+            "[%s] Global Amazon orders lock busy; owner=%s expires_at=%s. Waiting %.0fs.",
+            context,
+            owner,
+            expires_at,
+            sleep_for,
+        )
+        time_mod.sleep(sleep_for)
+
+
+def _release_main_ingestion_orders_lock(context: str) -> None:
+    released = release_job_lock(AMAZON_ORDERS_LOCK_NAME, locked_by=LOCK_OWNER_MAIN_INGESTION)
+    if released:
+        clear_job_stop_request(AMAZON_ORDERS_LOCK_NAME)
+        logger.info("[%s] Released global Amazon orders lock cleanup complete", context)
+    else:
+        logger.warning("[%s] Global Amazon orders lock release was skipped; stop flag was left unchanged", context)
+
 
 def _ensure_aware_utc(dt: datetime | None) -> datetime | None:
     if dt is None:
@@ -801,8 +909,19 @@ def fetch_scm_for_marketplace(self, marketplace_id: str, start_iso: str, end_iso
     Fetch SCM data for a single marketplace for a single day window [start, end].
     On success, update that marketplace's last_run in SCMLastRun table.
     """
+    resolved_company = normalize_company_name(company_name)
+    lock_context = f"fetch_scm_for_marketplace:{resolved_company}/{marketplace_id}"
+    lock_acquired, lock_skip_reason = _acquire_main_ingestion_orders_lock(lock_context)
+    if not lock_acquired:
+        return {
+            "marketplace_id": marketplace_id,
+            "company_name": resolved_company,
+            "status": "skipped",
+            "reason": lock_skip_reason,
+            "data_type": "scm_data",
+        }
+
     try:
-        resolved_company = normalize_company_name(company_name)
         access_token = get_access_token(marketplace_id, resolved_company)
         logger.info(f"[fetch_scm_for_marketplace] Obtained access token for {resolved_company}/{marketplace_id}")
 
@@ -967,6 +1086,9 @@ def fetch_scm_for_marketplace(self, marketplace_id: str, start_iso: str, end_iso
         
         logger.error(f"[fetch_scm_for_marketplace] Error for {resolved_company}/{marketplace_id}: {exc}")
         raise self.retry(exc=exc, countdown=30, max_retries=5)
+    finally:
+        if lock_acquired:
+            _release_main_ingestion_orders_lock(lock_context)
 
 
 @shared_task(bind=True, queue='fetching_scm')
@@ -983,6 +1105,15 @@ def process_scm_marketplaces(self):
     - Start: January 1, 2026
     - End: Current date - 1 (yesterday)
     """
+    lock_context = "process_scm_marketplaces"
+    lock_acquired, lock_skip_reason = _acquire_main_ingestion_orders_lock(lock_context)
+    if not lock_acquired:
+        return {
+            "status": "skipped",
+            "reason": lock_skip_reason,
+            "data_type": "scm_data",
+        }
+
     try:
         records = list(SCMLastRun.objects.all())
         if not records:
@@ -1069,6 +1200,27 @@ def process_scm_marketplaces(self):
     except Exception as exc:
         logger.error(f"[process_scm_marketplaces] Controller error: {exc}")
         raise self.retry(exc=exc, countdown=120, max_retries=10)
+    finally:
+        if lock_acquired:
+            _release_main_ingestion_orders_lock(lock_context)
+
+
+@shared_task(bind=True, queue='fetching_scm', soft_time_limit=3900, time_limit=4200)
+def reconcile_scm_order_statuses(self):
+    """
+    Lower-priority SCM order status reconciliation.
+
+    This task is intentionally manual/scheduler-agnostic for now. It uses the
+    global Amazon orders lock as status_sync and exits safely whenever the
+    protected main-ingestion window or main-ingestion lock/stop signal is active.
+    """
+    try:
+        return run_scm_order_reconciliation()
+    except Retry:
+        raise
+    except Exception as exc:
+        logger.error(f"[reconcile_scm_order_statuses] Reconciliation error: {exc}", exc_info=True)
+        raise self.retry(exc=exc, countdown=300, max_retries=2)
 
 
 def get_scm_status() -> dict:
