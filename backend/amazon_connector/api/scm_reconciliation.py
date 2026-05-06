@@ -378,6 +378,7 @@ def backfill_reconciliation_queue_from_scm_sources(
                             marketplace_id=current_marketplace_id,
                             source_table=expected_table,
                             company_name=resolved_company,
+                            due_immediately=True,
                         )
                         for key in ("inserted", "updated", "skipped_final", "skipped_current_day", "skipped_existing_final", "skipped_invalid"):
                             summary[key] += queue_result.get(key, 0)
@@ -387,6 +388,7 @@ def backfill_reconciliation_queue_from_scm_sources(
                         marketplace_id=current_marketplace_id,
                         source_table=expected_table,
                         company_name=company_name,
+                        due_immediately=True,
                     )
                     for key in ("inserted", "updated", "skipped_final", "skipped_current_day", "skipped_existing_final", "skipped_invalid"):
                         summary[key] += queue_result.get(key, 0)
@@ -411,8 +413,14 @@ def upsert_non_final_orders_to_reconciliation_queue(
     marketplace_id: str,
     source_table: str,
     company_name: Optional[str] = None,
+    due_immediately: bool = False,
 ) -> Dict:
-    """Upsert non-final SCM rows from the main ingestion into the reconciliation queue."""
+    """Upsert non-final SCM rows into the reconciliation queue.
+
+    Main ingestion uses backoff before the first status check. Historical
+    backfill marks rows due immediately so the first reconciliation run can
+    start catching up without waiting days.
+    """
     result = {
         "success": True,
         "inserted": 0,
@@ -455,7 +463,7 @@ def upsert_non_final_orders_to_reconciliation_queue(
         seller_sku = _normalize_text(row.get("SellerSKU"))
         asin = _normalize_text(row.get("ASIN"))
         last_update_date = _parse_datetime_value(row.get("LastUpdateDate"))
-        next_check_at = calculate_next_check_at(purchase_date, now)
+        next_check_at = now if due_immediately else calculate_next_check_at(purchase_date, now)
 
         with transaction.atomic():
             queue_row = (
