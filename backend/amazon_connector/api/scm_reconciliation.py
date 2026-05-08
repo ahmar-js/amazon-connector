@@ -574,6 +574,21 @@ def _get_due_queue_rows(remaining_rows: int, marketplace_counts: Dict[str, int])
     return selected
 
 
+def has_due_reconciliation_queue_rows() -> bool:
+    """Return True when any non-final queue row is currently due.
+
+    This is used by the Celery wrapper to decide whether continuous
+    reconciliation should resume quickly or sleep for an idle interval.
+    """
+    now = timezone.now()
+    cutoff = _business_today_start_utc(now)
+    return SCMOrderReconciliationQueue.objects.filter(
+        is_final=False,
+        next_check_at__lte=now,
+        purchase_date__lt=cutoff,
+    ).exists()
+
+
 def _get_access_token(marketplace_id: str, company_name: str) -> str:
     creds = get_credentials_for_marketplace(marketplace_id, normalize_company_name(company_name))
     response = requests.post(

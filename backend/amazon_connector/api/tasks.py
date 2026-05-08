@@ -38,6 +38,7 @@ from .job_locks import (
 )
 from .scm_reconciliation import (
     backfill_reconciliation_queue_from_scm_sources,
+    has_due_reconciliation_queue_rows,
     run_scm_order_reconciliation,
 )
 
@@ -118,6 +119,13 @@ HTTP_READ_TIMEOUT = int(os.getenv("FETCH_READ_TIMEOUT", "14400"))  # 4 hours
 MARKETPLACE_FETCH_DELAY = int(os.getenv("MARKETPLACE_FETCH_DELAY", "120"))  # 90 seconds
 # Delay for same credential group (marketplaces sharing credentials)
 SAME_CREDENTIAL_GROUP_DELAY = int(os.getenv("SAME_CREDENTIAL_GROUP_DELAY", "60"))  # 1 minute 
+
+# Status reconciliation self-scheduling. These delays keep the task alive
+# without holding locks or worker time while the main ingestion job has priority.
+RECONCILIATION_CONTINUE_DELAY_SECONDS = int(os.getenv("RECONCILIATION_CONTINUE_DELAY_SECONDS", "60"))
+RECONCILIATION_IDLE_DELAY_SECONDS = int(os.getenv("RECONCILIATION_IDLE_DELAY_SECONDS", "1800"))
+RECONCILIATION_BLOCKED_DELAY_SECONDS = int(os.getenv("RECONCILIATION_BLOCKED_DELAY_SECONDS", "900"))
+RECONCILIATION_PROTECTED_WINDOW_DELAY_SECONDS = int(os.getenv("RECONCILIATION_PROTECTED_WINDOW_DELAY_SECONDS", "900"))
 
 
 def _acquire_main_ingestion_orders_lock(context: str) -> tuple[bool, str | None]:
@@ -1209,17 +1217,71 @@ def process_scm_marketplaces(self):
             _release_main_ingestion_orders_lock(lock_context)
 
 
+def _next_reconciliation_countdown(summary: dict) -> int:
+    """Choose the next self-schedule delay from the reconciliation result."""
+    stop_reason = summary.get("stop_reason") or ""
+    processed = int(summary.get("processed") or 0)
+
+    if stop_reason == "protected_window":
+        return RECONCILIATION_PROTECTED_WINDOW_DELAY_SECONDS
+
+    if stop_reason in {"main_ingestion_running", "stop_requested"} or stop_reason.startswith("lock_busy"):
+        return RECONCILIATION_BLOCKED_DELAY_SECONDS
+
+    if stop_reason in {"runtime_limit_reached", "stopped_early"}:
+        return RECONCILIATION_CONTINUE_DELAY_SECONDS
+
+    if stop_reason == "no_due_rows":
+        try:
+            if has_due_reconciliation_queue_rows():
+                return RECONCILIATION_CONTINUE_DELAY_SECONDS
+        except Exception as exc:
+            logger.warning(
+                "[reconcile_scm_order_statuses] Could not check due queue rows before reschedule: %s",
+                exc,
+                exc_info=True,
+            )
+        return RECONCILIATION_IDLE_DELAY_SECONDS
+
+    if processed:
+        return RECONCILIATION_CONTINUE_DELAY_SECONDS
+
+    return RECONCILIATION_IDLE_DELAY_SECONDS
+
+
+def _schedule_next_reconciliation_run(summary: dict) -> dict:
+    countdown = _next_reconciliation_countdown(summary)
+    summary["auto_continue"] = True
+    summary["next_run_countdown_seconds"] = countdown
+    logger.info(
+        "[reconcile_scm_order_statuses] Scheduling next reconciliation run countdown=%s stop_reason=%s processed=%s",
+        countdown,
+        summary.get("stop_reason"),
+        summary.get("processed"),
+    )
+    reconcile_scm_order_statuses.apply_async(
+        kwargs={"auto_continue": True},
+        countdown=countdown,
+        queue="fetching_scm",
+    )
+    return summary
+
+
 @shared_task(bind=True, queue='fetching_scm', soft_time_limit=3900, time_limit=4200)
-def reconcile_scm_order_statuses(self):
+def reconcile_scm_order_statuses(self, auto_continue: bool = True):
     """
     Lower-priority SCM order status reconciliation.
 
-    This task is intentionally manual/scheduler-agnostic for now. It uses the
-    global Amazon orders lock as status_sync and exits safely whenever the
-    protected main-ingestion window or main-ingestion lock/stop signal is active.
+    By default this task self-schedules the next safe attempt after each run.
+    It still exits immediately whenever the protected main-ingestion window or
+    main-ingestion lock/stop signal is active; the next attempt is delayed.
     """
     try:
-        return run_scm_order_reconciliation()
+        summary = run_scm_order_reconciliation()
+        if auto_continue:
+            return _schedule_next_reconciliation_run(summary)
+        summary["auto_continue"] = False
+        return summary
     except Retry:
         raise
     except Exception as exc:
