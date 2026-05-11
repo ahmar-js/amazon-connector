@@ -177,6 +177,10 @@ def _recent_low_priority_cutoff_utc(now: Optional[datetime] = None) -> datetime:
     return _business_today_start_utc(now) - timedelta(days=RECENT_ORDER_LOW_PRIORITY_DAYS)
 
 
+def _format_sp_api_datetime(value: datetime) -> str:
+    return _ensure_aware_utc(value).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 def _is_purchase_date_allowed(purchase_date: Optional[datetime], now: Optional[datetime] = None) -> bool:
     if purchase_date is None:
         return False
@@ -636,6 +640,23 @@ def _get_access_token(marketplace_id: str, company_name: str) -> str:
     return response.json()["access_token"]
 
 
+def _get_sp_api_headers(
+    token_cache: Dict[Tuple[str, str], str],
+    company_name: str,
+    marketplace_id: str,
+) -> Dict[str, str]:
+    token_key = (company_name, marketplace_id)
+    if token_key not in token_cache:
+        token_cache[token_key] = _get_access_token(marketplace_id, company_name)
+
+    return {
+        "x-amz-access-token": token_cache[token_key],
+        "Content-Type": "application/json",
+        "x-amz-date": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "User-Agent": "AmazonConnector/1.0",
+    }
+
+
 def _api_get_json(url: str, headers: Dict[str, str], operation: str, params: Optional[Dict] = None) -> Dict:
     for attempt in range(1, API_MAX_RETRIES + 1):
         response = requests.get(url, headers=headers, params=params, timeout=API_REQUEST_TIMEOUT_SECONDS)
@@ -672,6 +693,63 @@ def _fetch_order(base_url: str, headers: Dict[str, str], order_id: str) -> Dict:
     if not order:
         raise RuntimeError(f"getOrder returned no payload for {order_id}")
     return order
+
+
+def _fetch_final_orders_for_ids(
+    base_url: str,
+    headers: Dict[str, str],
+    marketplace_id: str,
+    order_ids: List[str],
+    last_updated_after: datetime,
+) -> Dict[str, Dict]:
+    if not order_ids:
+        return {}
+
+    last_updated_before = timezone.now() - timedelta(minutes=3)
+    params = [
+        ("MarketplaceIds", marketplace_id),
+        ("LastUpdatedAfter", _format_sp_api_datetime(last_updated_after)),
+        ("LastUpdatedBefore", _format_sp_api_datetime(last_updated_before)),
+        ("MaxResultsPerPage", "100"),
+    ]
+    params.extend(("OrderStatuses", status) for status in sorted(FINAL_ORDER_STATUSES))
+    params.extend(("AmazonOrderIds", order_id) for order_id in order_ids)
+
+    logger.info(
+        "[scm_reconciliation] Fetching final statuses in batch marketplace_id=%s order_count=%s last_updated_after=%s last_updated_before=%s",
+        marketplace_id,
+        len(order_ids),
+        _format_sp_api_datetime(last_updated_after),
+        _format_sp_api_datetime(last_updated_before),
+    )
+
+    orders_by_id = {}
+    next_token = None
+    while True:
+        request_params = [("NextToken", next_token)] if next_token else params
+        data = _api_get_json(
+            f"{base_url}/orders/v0/orders",
+            headers,
+            f"getOrders final-status batch {marketplace_id}",
+            params=request_params,
+        )
+        payload = data.get("payload", {})
+        for order in payload.get("Orders", []):
+            order_id = _normalize_text(order.get("AmazonOrderId"))
+            if order_id:
+                orders_by_id[order_id] = order
+
+        next_token = payload.get("NextToken")
+        if not next_token:
+            break
+
+    logger.info(
+        "[scm_reconciliation] Final-status batch returned marketplace_id=%s requested=%s returned=%s",
+        marketplace_id,
+        len(order_ids),
+        len(orders_by_id),
+    )
+    return orders_by_id
 
 
 def _fetch_order_items(base_url: str, headers: Dict[str, str], order_id: str) -> List[Dict]:
@@ -933,6 +1011,8 @@ def _group_rows_by_order(rows: Iterable[SCMOrderReconciliationQueue]) -> Dict[Tu
 def _process_order_group(
     rows: List[SCMOrderReconciliationQueue],
     token_cache: Dict[Tuple[str, str], str],
+    preloaded_order: Optional[Dict] = None,
+    allow_individual_lookup: bool = True,
 ) -> Dict:
     first = rows[0]
     marketplace_id = first.marketplace_id or MARKETPLACE_CODE_TO_ID.get(first.marketplace_code, "")
@@ -984,22 +1064,19 @@ def _process_order_group(
         _mark_rows_api_failed(rows, f"unsupported_marketplace:{marketplace_id}")
         return {"processed": len(rows), "errors": len(rows)}
 
-    token_key = (first.company_name, marketplace_id)
-    if token_key not in token_cache:
-        token_cache[token_key] = _get_access_token(marketplace_id, first.company_name)
+    headers = _get_sp_api_headers(token_cache, first.company_name, marketplace_id)
 
-    headers = {
-        "x-amz-access-token": token_cache[token_key],
-        "Content-Type": "application/json",
-        "x-amz-date": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "User-Agent": "AmazonConnector/1.0",
-    }
-
-    try:
-        order = _fetch_order(base_url, headers, first.amazon_order_id)
-    except Exception as exc:
-        _mark_rows_api_failed(rows, str(exc))
-        return {"processed": len(rows), "errors": len(rows)}
+    if preloaded_order is not None:
+        order = preloaded_order
+    else:
+        if not allow_individual_lookup:
+            _reschedule_non_final_rows(rows, first.current_status, first.last_update_date)
+            return {"processed": len(rows), "rescheduled": len(rows)}
+        try:
+            order = _fetch_order(base_url, headers, first.amazon_order_id)
+        except Exception as exc:
+            _mark_rows_api_failed(rows, str(exc))
+            return {"processed": len(rows), "errors": len(rows), "individual_order_lookups": 1}
 
     status = _normalize_status(order.get("OrderStatus"))
     last_update_date = _parse_datetime_value(order.get("LastUpdateDate"))
@@ -1090,22 +1167,125 @@ def _process_reconciliation_batch(rows: List[SCMOrderReconciliationQueue]) -> Di
         "shipped_inserted": 0,
         "duplicates_avoided": 0,
         "errors": 0,
+        "final_status_batch_lookups": 0,
+        "individual_order_lookups": 0,
         "stopped_early": False,
     }
     token_cache = {}
+    order_groups = _group_rows_by_order(rows)
+    batch_candidates = defaultdict(dict)
 
-    for _, grouped_rows in _group_rows_by_order(rows).items():
+    def add_result(group_result: Dict) -> None:
+        for key in summary:
+            if key in group_result and isinstance(summary[key], int):
+                summary[key] += group_result[key]
+
+    for _, grouped_rows in order_groups.items():
         should_exit, reason = _status_sync_should_exit()
         if should_exit:
             logger.warning("[scm_reconciliation] Stopping before next order group reason=%s", reason)
             summary["stopped_early"] = True
             break
 
-        group_result = _process_order_group(grouped_rows, token_cache)
-        for key in summary:
-            if key in group_result and isinstance(summary[key], int):
-                summary[key] += group_result[key]
-        time.sleep(ORDER_LOOKUP_DELAY_SECONDS)
+        queued_statuses = _queued_statuses(grouped_rows)
+        if queued_statuses and queued_statuses.issubset(FINAL_ORDER_STATUSES):
+            group_result = _process_order_group(grouped_rows, token_cache)
+            add_result(group_result)
+            continue
+
+        first = grouped_rows[0]
+        marketplace_id = first.marketplace_id or MARKETPLACE_CODE_TO_ID.get(first.marketplace_code, "")
+        bucket_key = (first.company_name, marketplace_id, first.source_table)
+        batch_candidates[bucket_key][first.amazon_order_id] = grouped_rows
+
+    if not summary["stopped_early"]:
+        for (company_name, marketplace_id, source_table), groups_by_order in batch_candidates.items():
+            should_exit, reason = _status_sync_should_exit()
+            if should_exit:
+                logger.warning("[scm_reconciliation] Stopping before final-status batch reason=%s", reason)
+                summary["stopped_early"] = True
+                break
+
+            base_url = SP_API_BASE_URLS.get(marketplace_id)
+            expected_table = _validated_source_table(marketplace_id, source_table)
+            if not base_url or expected_table is None:
+                for grouped_rows in groups_by_order.values():
+                    group_result = _process_order_group(grouped_rows, token_cache)
+                    group_result["individual_order_lookups"] = group_result.get("individual_order_lookups", 0) + 1
+                    add_result(group_result)
+                    time.sleep(ORDER_LOOKUP_DELAY_SECONDS)
+                continue
+
+            purchase_dates = [
+                _ensure_aware_utc(row.purchase_date)
+                for grouped_rows in groups_by_order.values()
+                for row in grouped_rows
+                if row.purchase_date
+            ]
+            last_updated_after = (min(purchase_dates) - timedelta(days=1)) if purchase_dates else (timezone.now() - timedelta(days=45))
+
+            order_ids = list(groups_by_order.keys())
+            try:
+                headers = _get_sp_api_headers(token_cache, company_name, marketplace_id)
+                final_orders_by_id = _fetch_final_orders_for_ids(
+                    base_url,
+                    headers,
+                    marketplace_id,
+                    order_ids,
+                    last_updated_after,
+                )
+                summary["final_status_batch_lookups"] += 1
+            except Exception as exc:
+                logger.warning(
+                    "[scm_reconciliation] Final-status batch lookup failed; falling back to per-order lookup marketplace_id=%s company=%s orders=%s error=%s",
+                    marketplace_id,
+                    company_name,
+                    len(order_ids),
+                    exc,
+                    exc_info=True,
+                )
+                for grouped_rows in groups_by_order.values():
+                    should_exit, reason = _status_sync_should_exit()
+                    if should_exit:
+                        logger.warning("[scm_reconciliation] Stopping during per-order fallback reason=%s", reason)
+                        summary["stopped_early"] = True
+                        break
+                    group_result = _process_order_group(grouped_rows, token_cache)
+                    group_result["individual_order_lookups"] = group_result.get("individual_order_lookups", 0) + 1
+                    add_result(group_result)
+                    time.sleep(ORDER_LOOKUP_DELAY_SECONDS)
+                if summary["stopped_early"]:
+                    break
+                continue
+
+            for order_id, grouped_rows in groups_by_order.items():
+                should_exit, reason = _status_sync_should_exit()
+                if should_exit:
+                    logger.warning("[scm_reconciliation] Stopping during final-status batch processing reason=%s", reason)
+                    summary["stopped_early"] = True
+                    break
+
+                final_order = final_orders_by_id.get(order_id)
+                if final_order:
+                    group_result = _process_order_group(
+                        grouped_rows,
+                        token_cache,
+                        preloaded_order=final_order,
+                        allow_individual_lookup=False,
+                    )
+                    add_result(group_result)
+                else:
+                    first = grouped_rows[0]
+                    logger.info(
+                        "[scm_reconciliation] No final status found in batch; rescheduling without per-order lookup order_id=%s current_status=%s",
+                        order_id,
+                        first.current_status,
+                    )
+                    _reschedule_non_final_rows(grouped_rows, first.current_status, first.last_update_date)
+                    add_result({"processed": len(grouped_rows), "rescheduled": len(grouped_rows)})
+
+            if summary["stopped_early"]:
+                break
 
     logger.info("[scm_reconciliation] Batch finished summary=%s", summary)
     return summary
@@ -1124,6 +1304,8 @@ def run_scm_order_reconciliation() -> Dict:
         "shipped_inserted": 0,
         "duplicates_avoided": 0,
         "errors": 0,
+        "final_status_batch_lookups": 0,
+        "individual_order_lookups": 0,
         "batches": 0,
         "stop_reason": "",
         "started_at": started_at.isoformat(),
@@ -1184,7 +1366,16 @@ def run_scm_order_reconciliation() -> Dict:
             )
             batch_result = _process_reconciliation_batch(rows)
             summary["batches"] += 1
-            for key in ("processed", "marked_final", "rescheduled", "shipped_inserted", "duplicates_avoided", "errors"):
+            for key in (
+                "processed",
+                "marked_final",
+                "rescheduled",
+                "shipped_inserted",
+                "duplicates_avoided",
+                "errors",
+                "final_status_batch_lookups",
+                "individual_order_lookups",
+            ):
                 summary[key] += batch_result.get(key, 0)
 
             if batch_result.get("stopped_early"):
