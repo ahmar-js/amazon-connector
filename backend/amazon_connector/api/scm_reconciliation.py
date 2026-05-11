@@ -47,6 +47,7 @@ MAX_RECONCILIATION_ROWS_PER_RUN = 500
 MAX_RECONCILIATION_ROWS_PER_MARKETPLACE = 500
 MAX_RECONCILIATION_BATCH_SIZE = 50
 MAX_RECONCILIATION_BACKFILL_ROWS_PER_TABLE = 5000
+RECENT_ORDER_LOW_PRIORITY_DAYS = 2
 
 ORDER_LOOKUP_DELAY_SECONDS = 2
 ORDER_ITEMS_LOOKUP_DELAY_SECONDS = 2
@@ -172,6 +173,10 @@ def _business_today_start_utc(now: Optional[datetime] = None) -> datetime:
     return pkt_midnight.astimezone(timezone.utc)
 
 
+def _recent_low_priority_cutoff_utc(now: Optional[datetime] = None) -> datetime:
+    return _business_today_start_utc(now) - timedelta(days=RECENT_ORDER_LOW_PRIORITY_DAYS)
+
+
 def _is_purchase_date_allowed(purchase_date: Optional[datetime], now: Optional[datetime] = None) -> bool:
     if purchase_date is None:
         return False
@@ -183,8 +188,8 @@ def calculate_next_check_at(purchase_date: Optional[datetime], reference_time: O
     purchase_dt = _ensure_aware_utc(purchase_date) if purchase_date else None
     age = now - purchase_dt if purchase_dt else timedelta(days=30)
 
-    if age < timedelta(hours=24):
-        delay = timedelta(hours=6)
+    if age < timedelta(days=2):
+        delay = timedelta(hours=24)
     elif age < timedelta(days=3):
         delay = timedelta(hours=12)
     elif age < timedelta(days=7):
@@ -544,31 +549,55 @@ def _status_sync_should_exit() -> Tuple[bool, str]:
 def _get_due_queue_rows(remaining_rows: int, marketplace_counts: Dict[str, int]) -> List[SCMOrderReconciliationQueue]:
     now = timezone.now()
     cutoff = _business_today_start_utc(now)
+    recent_cutoff = _recent_low_priority_cutoff_utc(now)
     selected = []
+    selected_buckets = {"older": 0, "recent_low_priority": 0}
     scan_limit = min(max(MAX_RECONCILIATION_BATCH_SIZE * 3, MAX_RECONCILIATION_BATCH_SIZE), remaining_rows * 3)
+    target_size = min(MAX_RECONCILIATION_BATCH_SIZE, remaining_rows)
 
-    candidates = (
+    base_candidates = (
         SCMOrderReconciliationQueue.objects
         .filter(
             is_final=False,
             next_check_at__lte=now,
             purchase_date__lt=cutoff,
         )
-        .order_by("marketplace_code", "next_check_at", "id")[:scan_limit]
     )
 
-    for row in candidates:
-        if marketplace_counts[row.marketplace_code] >= MAX_RECONCILIATION_ROWS_PER_MARKETPLACE:
-            continue
-        selected.append(row)
-        marketplace_counts[row.marketplace_code] += 1
-        if len(selected) >= min(MAX_RECONCILIATION_BATCH_SIZE, remaining_rows):
-            break
+    def append_candidates(candidates, bucket_name: str) -> None:
+        for row in candidates:
+            if marketplace_counts[row.marketplace_code] >= MAX_RECONCILIATION_ROWS_PER_MARKETPLACE:
+                continue
+            selected.append(row)
+            selected_buckets[bucket_name] += 1
+            marketplace_counts[row.marketplace_code] += 1
+            if len(selected) >= target_size:
+                break
+
+    # Prefer older due rows first. Rows from the last two PKT business days are
+    # lower priority because they commonly remain Pending/Unshipped and can
+    # consume Amazon API calls without producing shipped-order inserts.
+    older_candidates = (
+        base_candidates
+        .filter(purchase_date__lt=recent_cutoff)
+        .order_by("marketplace_code", "next_check_at", "id")[:scan_limit]
+    )
+    append_candidates(older_candidates, "older")
+
+    if len(selected) < target_size:
+        recent_candidates = (
+            base_candidates
+            .filter(purchase_date__gte=recent_cutoff)
+            .order_by("marketplace_code", "next_check_at", "id")[:scan_limit]
+        )
+        append_candidates(recent_candidates, "recent_low_priority")
 
     logger.info(
-        "[scm_reconciliation] Selected %s due rows cutoff_utc=%s remaining_rows=%s",
+        "[scm_reconciliation] Selected %s due rows cutoff_utc=%s recent_low_priority_cutoff_utc=%s buckets=%s remaining_rows=%s",
         len(selected),
         cutoff,
+        recent_cutoff,
+        selected_buckets,
         remaining_rows,
     )
     return selected
