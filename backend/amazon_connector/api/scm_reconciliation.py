@@ -816,6 +816,54 @@ def _update_source_order_status(conn, source_table: str, order_id: str, status: 
     return rowcount
 
 
+def _queued_statuses(rows: Iterable[SCMOrderReconciliationQueue]) -> set:
+    return {_normalize_status(row.current_status) for row in rows if _normalize_status(row.current_status)}
+
+
+def _all_shipped_rows_exist_in_scm_orders(conn, rows: Iterable[SCMOrderReconciliationQueue]) -> bool:
+    exists_sql = text(
+        """
+        SELECT TOP 1 1
+        FROM scm_amazon_orders
+        WHERE OrderId = :OrderId
+          AND UPPER(LTRIM(RTRIM(SKU))) = UPPER(:SKU)
+          AND Region = :Region
+          AND Company = :Company
+        """
+    )
+
+    for row in rows:
+        seller_sku = _normalize_text(row.seller_sku)
+        if not seller_sku:
+            logger.info(
+                "[scm_reconciliation] Cannot finalize queued shipped row without API because SKU is missing order_id=%s row_id=%s",
+                row.amazon_order_id,
+                row.id,
+            )
+            return False
+
+        exists = conn.execute(
+            exists_sql,
+            {
+                "OrderId": row.amazon_order_id,
+                "SKU": seller_sku,
+                "Region": row.marketplace_code,
+                "Company": row.company_name,
+            },
+        ).first()
+        if not exists:
+            logger.info(
+                "[scm_reconciliation] Queued shipped row not found in scm_amazon_orders; API recovery is required order_id=%s sku=%s region=%s company=%s",
+                row.amazon_order_id,
+                seller_sku,
+                row.marketplace_code,
+                row.company_name,
+            )
+            return False
+
+    return True
+
+
 def _mark_rows_api_failed(rows: Iterable[SCMOrderReconciliationQueue], error: str, current_status: Optional[str] = None) -> None:
     now = timezone.now()
     next_check_at = now + timedelta(hours=1)
@@ -893,6 +941,44 @@ def _process_order_group(
         _mark_rows_api_failed(rows, "invalid_source_table")
         return {"processed": len(rows), "errors": len(rows)}
 
+    from .simple_db_save import create_mssql_connection
+
+    queued_statuses = _queued_statuses(rows)
+    if queued_statuses and queued_statuses.issubset(FINAL_ORDER_STATUSES):
+        if SHIPPED_STATUS not in queued_statuses:
+            final_status = sorted(queued_statuses)[0]
+            logger.info(
+                "[scm_reconciliation] Queued order already has final non-shipped status; marking final without API order_id=%s statuses=%s",
+                first.amazon_order_id,
+                sorted(queued_statuses),
+            )
+            _mark_rows_final(rows, final_status, None)
+            return {"processed": len(rows), "marked_final": len(rows)}
+
+        if queued_statuses == {SHIPPED_STATUS}:
+            try:
+                engine = create_mssql_connection()
+                with engine.begin() as conn:
+                    _update_source_order_status(conn, source_table, first.amazon_order_id, SHIPPED_STATUS)
+                    if _all_shipped_rows_exist_in_scm_orders(conn, rows):
+                        logger.info(
+                            "[scm_reconciliation] Queued shipped order already exists in scm_amazon_orders; marking final without API order_id=%s",
+                            first.amazon_order_id,
+                        )
+                        _mark_rows_final(rows, SHIPPED_STATUS, None)
+                        return {
+                            "processed": len(rows),
+                            "marked_final": len(rows),
+                            "duplicates_avoided": len(rows),
+                        }
+            except Exception as exc:
+                logger.warning(
+                    "[scm_reconciliation] Could not verify queued shipped order locally; API recovery will be attempted order_id=%s error=%s",
+                    first.amazon_order_id,
+                    exc,
+                    exc_info=True,
+                )
+
     base_url = SP_API_BASE_URLS.get(marketplace_id)
     if not base_url:
         _mark_rows_api_failed(rows, f"unsupported_marketplace:{marketplace_id}")
@@ -924,8 +1010,6 @@ def _process_order_group(
         status,
     )
 
-    from .simple_db_save import create_mssql_connection
-
     if status == SHIPPED_STATUS:
         try:
             time.sleep(ORDER_ITEMS_LOOKUP_DELAY_SECONDS)
@@ -935,6 +1019,11 @@ def _process_order_group(
 
             marketplace_code = _marketplace_code_for_id(marketplace_id)
             _, azure_df = process_amazon_data([order], items, marketplace_code, first.company_name)
+            if azure_df.empty:
+                logger.warning(
+                    "[scm_reconciliation] Shipped order produced no insertable scm_amazon_orders rows order_id=%s",
+                    first.amazon_order_id,
+                )
 
             engine = create_mssql_connection()
             with engine.begin() as conn:

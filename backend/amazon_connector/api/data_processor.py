@@ -816,6 +816,10 @@ class AmazonDataProcessor:
         # 5. Filter out null totals (if Total exists)
         if 'Total' in df.columns:
             df = df[df['Total'].notna()].copy()
+
+        if df.empty:
+            logger.warning("No insertable Azure rows found after filtering")
+            return df
         
         # 6. Clean SKU data efficiently (if SKU exists)
         if 'SKU' in df.columns:
@@ -857,6 +861,9 @@ class AmazonDataProcessor:
         Returns:
             DataFrame with updated mappings
         """
+        if df.empty or 'SalesChannel' not in df.columns:
+            return df
+
         # Update Channel (all Amazon marketplaces -> 'Amazon')
         amazon_mask = df['SalesChannel'].str.startswith('Amazon.', na=False)
         df.loc[amazon_mask, 'Channel'] = 'Amazon'
