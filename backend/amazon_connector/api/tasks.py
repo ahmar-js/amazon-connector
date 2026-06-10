@@ -72,7 +72,7 @@ def get_access_token(marketplace_id: str, company_name: str | None = None) -> st
     logger.info(f"[get_access_token] Requesting token for marketplace: {marketplace_id}, company: {resolved_company}")
     
     response = requests.post(
-        "http://127.0.0.1:8000/api/connect/",
+        f"{API_BASE_URL}/api/connect/",
         json=payload,
         timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
     )
@@ -109,6 +109,10 @@ def get_access_token(marketplace_id: str, company_name: str | None = None) -> st
 SEED_START_LAST_RUN = timezone.datetime(2023, 11, 1, 23, 59, 59, tzinfo=timezone.utc)
 # Fixed inclusive end date per requirements
 END_DATE = timezone.datetime(2025, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+
+# Base URL used for the self-referencing internal API calls below.
+# Defaults to local Django for dev; override via API_BASE_URL in production.
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 
 # HTTP timeouts for calling the local Django endpoint
 # Defaults: connect 5s, read 4h (adjust via env if fetch can be longer)
@@ -328,7 +332,7 @@ def fetch_orders_for_marketplace(self, marketplace_id: str, start_iso: str, end_
 
         logger.info(f"[fetch_orders_for_marketplace] {marketplace_id}/{resolved_company} -> {start_iso} to {end_iso}")
         response = requests.post(
-            "http://127.0.0.1:8000/api/fetch-data/",
+            f"{API_BASE_URL}/api/fetch-data/",
             json=payload,
             timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
         )
@@ -624,7 +628,7 @@ def fetch_missing_orders_usa_day(self, day_str: str):
 
         logger.info(f"[fetch_missing_orders_{MARKETPLACE_NAME}_day] {MARKETPLACE_NAME} -> {start_iso} to {end_iso}")
         response = requests.post(
-            "http://127.0.0.1:8000/api/fetch-data/",
+            f"{API_BASE_URL}/api/fetch-data/",
             json=payload,
             timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
         )
@@ -802,7 +806,7 @@ def generate_reports(self):
     mp_start = time_mod.time()
     try:
         response = requests.post(
-            "http://127.0.0.1:8000/api/inventory/reports/",
+            f"{API_BASE_URL}/api/inventory/reports/",
             json=payload,
             timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
         )
@@ -972,7 +976,7 @@ def fetch_scm_for_marketplace(self, marketplace_id: str, start_iso: str, end_iso
 
         logger.info(f"[fetch_scm_for_marketplace] {resolved_company}/{marketplace_id} -> {start_iso} to {end_iso}")
         response = requests.post(
-            "http://127.0.0.1:8000/api/fetch-data/",
+            f"{API_BASE_URL}/api/fetch-data/",
             json=payload,
             timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
         )
